@@ -1,6 +1,8 @@
 # Default PyPI onnxruntime-gpu==1.31.1 targets CUDA 13.x.
-# For CUDA 12.x environments (Azure index serves up to 1.30.0, ORT>=1.25 for TableCenterNet):
-#   pip install -r requirements-cuda.txt && pip install --force-reinstall --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu==1.30.0
+# If CUDA 13.x system toolkit is not installed, add pip CUDA 13 runtime wheels and restart python:
+#   pip install nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cusparse nvidia-cusolver nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cudnn-cu13
+# For CUDA 12.x environments (Azure index serves up to 1.29.0 stable; ORT>=1.25 for TableCenterNet):
+#   pip install -r requirements-cuda.txt && pip install --force-reinstall --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu==1.29.0
 flet[desktop]==1.1.2
 dill==0.3.8
 lxml==6.1.3

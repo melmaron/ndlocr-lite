@@ -623,9 +623,10 @@ def make_session_with_profile(
     except Exception as exc:
         msg = str(exc)
         if "DeformConv" in msg or "NOT_IMPLEMENTED" in msg or "No Op registered" in msg:
+            ort_ver = getattr(ort, "__version__", "unknown")
             raise RuntimeError(
                 "Failed to load the ONNX model. This model contains ONNX DeformConv. "
-                "onnxruntime==1.23.2 does not support this model; use ORT 1.25+ or "
+                f"Installed onnxruntime=={ort_ver} does not support this model; use ORT 1.25+ or "
                 "re-export the model with DCN decomposed to GridSample.\n"
                 f"Original error: {msg}"
             ) from exc

@@ -79,6 +79,14 @@ class TableCenterNetRobustnessTest(unittest.TestCase):
         self.assertEqual(tables, [])
         self.assertEqual(result, {})
 
+    def test_deform_conv_error_reports_active_ort_version(self):
+        with patch.object(tablecenternet.ort, "__version__", "1.24.4"), patch(
+            "ort_provider.create_inference_session",
+            side_effect=RuntimeError("NOT_IMPLEMENTED: No Op registered for DeformConv"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"onnxruntime==1\.24\.4"):
+                tablecenternet.make_session_with_profile("table.onnx", device="dml")
+
 
 class TableStructureFeatureTest(unittest.TestCase):
     def test_write_html_files_tolerates_none_inputs(self):

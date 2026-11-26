@@ -90,7 +90,8 @@ _INSTALL_HINTS: Dict[str, str] = {
     ),
     "dml": (
         "Windows DirectML環境向けに `pip install onnxruntime-directml` を導入してください"
-        "（注意: onnxruntime-directml 1.24系では v2 の表構造認識 TableCenterNet は非対応です）。"
+        "（注意: DirectML では DEIMv2 が自動 CPU フォールバックし PARSeq のみ DirectML GPU 実行となります。"
+        "また onnxruntime-directml 1.24系では v2 の表構造認識 TableCenterNet は非対応です）。"
     ),
 }
 
@@ -221,6 +222,39 @@ def _safe_ep_devices() -> List[Any]:
         return []
 
 
+_VIRTUAL_OR_SOFTWARE_VENDOR_IDS = frozenset({0x1414, 0x10005})
+_SOFTWARE_VENDOR_MARKERS = (
+    "llvmpipe",
+    "swiftshader",
+    "microsoft basic render",
+    "warp",
+)
+
+
+def _is_software_or_virtual_webgpu_device(ep_device: Any) -> bool:
+    hw = getattr(ep_device, "device", None)
+    if hw is None:
+        return False
+    vendor_id = getattr(hw, "vendor_id", None)
+    if isinstance(vendor_id, int) and not isinstance(vendor_id, bool):
+        if vendor_id in _VIRTUAL_OR_SOFTWARE_VENDOR_IDS:
+            return True
+    vendor_str = str(getattr(hw, "vendor", "") or "").strip().casefold()
+    if any(marker in vendor_str for marker in _SOFTWARE_VENDOR_MARKERS):
+        return True
+    hw_type = getattr(hw, "type", None)
+    cpu_enum = getattr(getattr(ort, "OrtHardwareDeviceType", None), "CPU", None)
+    if cpu_enum is not None and hw_type is not None and hw_type == cpu_enum:
+        return True
+    return False
+
+
+def _is_dml_deim_model(model_label: str, model_path: str | Path = "") -> bool:
+    label_cf = (model_label or "").casefold()
+    name_cf = Path(model_path).name.casefold() if model_path else ""
+    return "deim" in label_cf or "deim" in name_cf
+
+
 def _is_gpu_hw_device(ep_device: Any) -> bool:
     meta = getattr(ep_device, "ep_metadata", None) or {}
     ov_dev = str(meta.get("ov_device", "")).strip().upper()
@@ -234,12 +268,22 @@ def _is_gpu_hw_device(ep_device: Any) -> bool:
     return "GPU" in str(hw_type).upper()
 
 
-def _find_plugin_devices_for_backend(backend: str, ep_devices: Sequence[Any]) -> List[Any]:
+def _find_plugin_devices_for_backend(
+    backend: str,
+    ep_devices: Sequence[Any],
+    *,
+    include_virtual_webgpu: bool = False,
+) -> List[Any]:
     if backend == "webgpu":
-        return [
+        all_webgpu = [
             d for d in ep_devices
             if "webgpu" in str(getattr(d, "ep_name", "")).casefold()
         ]
+        hw_devs = [d for d in all_webgpu if not _is_software_or_virtual_webgpu_device(d)]
+        if not include_virtual_webgpu:
+            return hw_devs
+        sw_devs = [d for d in all_webgpu if _is_software_or_virtual_webgpu_device(d)]
+        return hw_devs + sw_devs
     if backend == "openvino":
         return [
             d for d in ep_devices
@@ -304,8 +348,16 @@ def detect_available_backends() -> Dict[str, Dict[str, Any]]:
                 elif "openvino_ep" in _PLUGIN_ERRORS:
                     extra_note = f"plugin error: {_PLUGIN_ERRORS['openvino_ep']}"
             elif backend == "webgpu":
+                webgpu_all = _find_plugin_devices_for_backend(
+                    "webgpu", ep_devices, include_virtual_webgpu=True
+                )
                 if "webgpu" in _PLUGIN_ERRORS:
                     extra_note = f"plugin error: {_PLUGIN_ERRORS['webgpu']}"
+                elif webgpu_all:
+                    extra_note = (
+                        "WebGPU plugin loaded, but only software/virtual adapter detected "
+                        "(skipped for auto; use --device webgpu to force)"
+                    )
                 elif plugin_is_loaded:
                     extra_note = "WebGPU plugin loaded, but no compatible GPU adapter detected"
 
@@ -363,6 +415,8 @@ def _create_session_for_backend(
     device_id: int,
     cpu_single_thread: bool,
     enable_mem_reuse: bool = True,
+    allow_software_webgpu: bool = False,
+    model_label: str = "model",
 ) -> Tuple[ort.InferenceSession, List[str]]:
     model_str = str(model_path)
     register_plugin_eps()
@@ -388,7 +442,11 @@ def _create_session_for_backend(
         providers = [
             (
                 "CUDAExecutionProvider",
-                {"device_id": int(device_id), "cudnn_conv_algo_search": "HEURISTIC"},
+                {
+                    "device_id": int(device_id),
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "use_tf32": "0",
+                },
             ),
             "CPUExecutionProvider",
         ]
@@ -462,7 +520,9 @@ def _create_session_for_backend(
         raise RuntimeError("OpenVINO GPU device is not available.")
 
     if backend == "webgpu":
-        webgpu_devs = _find_plugin_devices_for_backend("webgpu", ep_devices)
+        webgpu_devs = _find_plugin_devices_for_backend(
+            "webgpu", ep_devices, include_virtual_webgpu=allow_software_webgpu
+        )
         if webgpu_devs:
             if not 0 <= device_id < len(webgpu_devs):
                 raise RuntimeError(
@@ -470,6 +530,11 @@ def _create_session_for_backend(
                     f"({len(webgpu_devs)} adapter(s) detected)."
                 )
             chosen = webgpu_devs[device_id]
+            if _is_software_or_virtual_webgpu_device(chosen):
+                _emit_warning_once(
+                    ("webgpu", "software", f"{device_id}"),
+                    f"[WARN] WebGPU ({model_label}) はソフトウェア/仮想アダプタを使用して実行されます (CPU より遅くなる場合があります)。",
+                )
             ep_name = str(chosen.ep_name)
             opt = _build_session_options(
                 cpu_single_thread=False,
@@ -481,6 +546,11 @@ def _create_session_for_backend(
             if ep_name in active or any("webgpu" in p.casefold() for p in active):
                 return session, active
             raise RuntimeError(f"WebGPU plugin EP did not activate: {active}")
+        if _find_plugin_devices_for_backend("webgpu", ep_devices, include_virtual_webgpu=True):
+            raise RuntimeError(
+                "WebGPU plugin loaded, but only software/virtual adapter detected "
+                "(skipped for auto; use --device webgpu to force)."
+            )
         if "webgpu" in _REGISTERED_PLUGINS:
             raise RuntimeError("WebGPU plugin loaded, but no compatible GPU adapter detected.")
         if "WebGpuExecutionProvider" in available_providers:
@@ -499,6 +569,11 @@ def _create_session_for_backend(
     if backend == "dml":
         if "DmlExecutionProvider" not in available_providers:
             raise RuntimeError("DmlExecutionProvider is not available.")
+        if _is_dml_deim_model(model_label, model_path):
+            raise RuntimeError(
+                "DmlExecutionProvider produces corrupted bounding boxes on DEIMv2 layout detection; "
+                "DEIMv2 must run on CPU (or CUDA/OpenVINO/WebGPU)."
+            )
         opt = _build_session_options(
             cpu_single_thread=False,
             enable_mem_reuse=enable_mem_reuse,
@@ -578,6 +653,8 @@ def create_inference_session(
                     device_id=device_id,
                     cpu_single_thread=cpu_single_thread,
                     enable_mem_reuse=enable_mem_reuse,
+                    allow_software_webgpu=False,
+                    model_label=model_label,
                 )
                 return session, _make_profile(
                     requested_device="auto",
@@ -600,6 +677,7 @@ def create_inference_session(
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
             enable_mem_reuse=enable_mem_reuse,
+            model_label=model_label,
         )
         warning_msg = None
         if failures:
@@ -624,6 +702,7 @@ def create_inference_session(
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
             enable_mem_reuse=enable_mem_reuse,
+            model_label=model_label,
         )
         return session, _make_profile(
             requested_device="cpu",
@@ -640,6 +719,8 @@ def create_inference_session(
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
             enable_mem_reuse=enable_mem_reuse,
+            allow_software_webgpu=(requested == "webgpu"),
+            model_label=model_label,
         )
         if requested == "dml" and not ort_supports_deform_conv() and "table" in model_label.casefold():
             _emit_warning_once(
@@ -666,6 +747,7 @@ def create_inference_session(
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
             enable_mem_reuse=enable_mem_reuse,
+            model_label=model_label,
         )
         warning_msg = _format_fallback_warning(requested, "cpu", str(exc), model_label)
         _emit_warning_once((requested, "cpu", str(exc)), warning_msg)
@@ -707,8 +789,14 @@ def format_device_diagnostics() -> str:
         for idx, dev in enumerate(ep_devices):
             hw = getattr(dev, "device", None)
             meta = getattr(dev, "ep_metadata", None) or {}
+            vid = getattr(hw, "vendor_id", None) if hw is not None else None
+            vid_str = (
+                f", vid={hex(vid)}"
+                if isinstance(vid, int) and not isinstance(vid, bool)
+                else ""
+            )
             hw_desc = (
-                f"type={getattr(hw, 'type', '?')}, vendor={getattr(hw, 'vendor', '?')}, id={getattr(hw, 'device_id', '?')}"
+                f"type={getattr(hw, 'type', '?')}, vendor={getattr(hw, 'vendor', '?')}{vid_str}, id={getattr(hw, 'device_id', '?')}"
                 if hw is not None
                 else "no-hw-info"
             )

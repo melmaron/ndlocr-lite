@@ -264,8 +264,141 @@ class OrtProviderTest(unittest.TestCase):
         self.assertFalse(captured["opt"].enable_mem_reuse)
         self.assertEqual(
             captured["providers"][0],
-            ("CUDAExecutionProvider", {"device_id": 1, "cudnn_conv_algo_search": "HEURISTIC"}),
+            (
+                "CUDAExecutionProvider",
+                {"device_id": 1, "cudnn_conv_algo_search": "HEURISTIC", "use_tf32": "0"},
+            ),
         )
+
+    def test_webgpu_virtual_or_software_adapter_is_skipped_by_auto_but_allowed_explicitly(self):
+        wsl_virtual = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="", vendor_id=0x1414, device_id=142),
+        )
+        llvmpipe = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="Mesa llvmpipe", vendor_id=0x10005, device_id=0),
+        )
+        amd_hw = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="AMD", vendor_id=0x1002, device_id=1),
+        )
+
+        self.assertEqual(
+            ort_provider._find_plugin_devices_for_backend(
+                "webgpu", [wsl_virtual, amd_hw, llvmpipe]
+            ),
+            [amd_hw],
+        )
+        self.assertEqual(
+            ort_provider._find_plugin_devices_for_backend(
+                "webgpu", [wsl_virtual, amd_hw, llvmpipe], include_virtual_webgpu=True
+            ),
+            [amd_hw, wsl_virtual, llvmpipe],
+        )
+
+        captured = {}
+
+        class _FakeOpt:
+            def __init__(self):
+                self.devs = None
+
+            def add_provider_for_devices(self, devs, cfg):
+                self.devs = list(devs)
+
+        class _FakeWebGpuSess:
+            def __init__(self, path, sess_options=None, providers=None):
+                captured["path"] = path
+                captured["opt"] = sess_options
+
+            def get_providers(self):
+                return ["WebGpuExecutionProvider", "CPUExecutionProvider"]
+
+        with patch.dict(
+            ort_provider._REGISTERED_PLUGINS,
+            {"webgpu": "/fake/wgpu.so"},
+            clear=True,
+        ), patch.object(
+            ort_provider, "register_plugin_eps", return_value=dict(ort_provider._REGISTERED_PLUGINS)
+        ), patch.object(
+            ort_provider.ort,
+            "get_available_providers",
+            return_value=["CPUExecutionProvider", "WebGpuExecutionProvider"],
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[wsl_virtual, llvmpipe]
+        ), patch.object(
+            ort_provider, "_build_session_options", return_value=_FakeOpt()
+        ), patch.object(
+            ort_provider.ort, "InferenceSession", side_effect=_FakeWebGpuSess
+        ):
+            avail = ort_provider.detect_available_backends()
+            self.assertFalse(avail["webgpu"]["available"])
+            self.assertIn("software/virtual adapter", avail["webgpu"]["detail"])
+            self.assertEqual(ort_provider.resolve_auto_backend_name(), "cpu")
+            with self.assertRaisesRegex(RuntimeError, "software/virtual adapter"):
+                ort_provider._create_session_for_backend(
+                    "model.onnx",
+                    "webgpu",
+                    device_id=0,
+                    cpu_single_thread=False,
+                )
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                _, profile = ort_provider.create_inference_session(
+                    "model.onnx",
+                    device="webgpu",
+                    model_label="PARSeq-30",
+                )
+            self.assertEqual(profile.active_backend, "webgpu")
+            self.assertEqual(captured["opt"].devs, [wsl_virtual])
+            self.assertIn("ソフトウェア/仮想アダプタ", stderr.getvalue())
+
+    def test_dml_blocks_deim_with_cpu_fallback_but_allows_parseq(self):
+        class _FakeDmlSess:
+            def __init__(self, path, sess_options=None, providers=None):
+                self._providers = [
+                    p[0] if isinstance(p, tuple) else p for p in (providers or [])
+                ]
+
+            def get_providers(self):
+                return self._providers
+
+        with patch.object(
+            ort_provider.ort,
+            "get_available_providers",
+            return_value=["DmlExecutionProvider", "CPUExecutionProvider"],
+        ), patch.object(ort_provider.ort, "InferenceSession", side_effect=_FakeDmlSess):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                _, deim_profile = ort_provider.create_inference_session(
+                    "deim-s-1020x1020.onnx",
+                    device="dml",
+                    strict_device=False,
+                    model_label="DEIM",
+                )
+            self.assertEqual(deim_profile.active_backend, "cpu")
+            self.assertTrue(deim_profile.fallback_occurred)
+            self.assertIn("DEIM", stderr.getvalue())
+
+            with self.assertRaisesRegex(RuntimeError, "corrupted bounding boxes"):
+                ort_provider.create_inference_session(
+                    "deim-s-1020x1020.onnx",
+                    device="dml",
+                    strict_device=True,
+                    model_label="DEIM",
+                )
+
+            _, parseq_profile = ort_provider.create_inference_session(
+                "parseq-ndl-24x256-30.onnx",
+                device="dml",
+                strict_device=True,
+                model_label="PARSEQ(rec30)",
+            )
+            self.assertEqual(parseq_profile.active_backend, "dml")
 
 
 if __name__ == "__main__":
