@@ -991,7 +991,6 @@ def _run_ocr_on_image_array(
         resultobj[1][det["class_index"]].append([xmin, ymin, xmax, ymax, conf, det["pred_char_count"], det["pred_markdown_style"]])
 
     xmlstr = convert_to_xml_string3(img_w, img_h, inputname, classeslist, resultobj)
-    xmlstr = xmlstr.replace("&", "&amp;")
     xmlstr = "<OCRDATASET>" + xmlstr + "</OCRDATASET>"
     root = ET.fromstring(xmlstr)
     eval_xml(root, logger=None)
@@ -1801,7 +1800,6 @@ def process(args):
                     resultobj[0][0].append([xmin,ymin,xmax,ymax])
                 resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf,char_count])
             xmlstr=convert_to_xml_string3(img_w, img_h, imgname, classeslist, resultobj)
-            xmlstr = xmlstr.replace("&", "&amp;")
             xmlstr="<OCRDATASET>"+xmlstr+"</OCRDATASET>"
             root = ET.fromstring(xmlstr)
             eval_xml(root, logger=None)

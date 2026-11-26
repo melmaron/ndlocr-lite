@@ -813,7 +813,14 @@ def convert_to_xml_string3(img_w, img_h, img_path, classes, result,
     #import cv2
 
     img_name = os.path.basename(img_path)
-    s = f'<PAGE IMAGENAME = "{img_name}" WIDTH = "{img_w}" HEIGHT = "{img_h}">\n'
+    # PAGE@IMAGENAME is an XML attribute: filenames that are legal on POSIX but
+    # contain '<', '"' or '&' must be escaped or the whole document is invalid.
+    xml_img_name = (
+        img_name.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace('"', "&quot;")
+    )
+    s = f'<PAGE IMAGENAME = "{xml_img_name}" WIDTH = "{img_w}" HEIGHT = "{img_h}">\n'
 
     res_textblockes = result[0]
     res_bbox = result[1]

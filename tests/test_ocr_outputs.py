@@ -236,5 +236,93 @@ class OcrOutputTest(unittest.TestCase):
             ocr._track_write_future(failing, FakeFuture("y"), limit=2)
 
 
+
+class XmlFilenameEscapingTest(unittest.TestCase):
+    """PAGE@IMAGENAME must stay well-formed for POSIX filenames with <, >, &, "."""
+
+    def _empty_result(self, classes):
+        result = [dict(), dict()]
+        result[0][0] = []
+        for index in range(len(classes)):
+            result[1][index] = []
+        return result
+
+    def test_convert_to_xml_string3_returns_well_formed_xml_for_special_filenames(self):
+        import xml.etree.ElementTree as ET
+
+        from ndl_parser import convert_to_xml_string3
+
+        classes = _class_names()
+        result = self._empty_result(classes)
+        names = [
+            "page.png",
+            "a&b.png",
+            "a&amp;b.png",
+            "a<b.png",
+            "a>b.png",
+            'a"b.png',
+            "日本語 ページ.png",
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                xml = convert_to_xml_string3(120, 160, name, classes, result)
+                root = ET.fromstring("<OCRDATASET>" + xml + "</OCRDATASET>")
+                self.assertEqual(root.find("PAGE").get("IMAGENAME"), name)
+
+    def test_process_writes_outputs_for_xml_special_filenames(self):
+        import xml.etree.ElementTree as ET
+
+        names = ["a<b.png", 'a"b.png', "a&b.png", "a&amp;b.png"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "input"
+            src.mkdir()
+            try:
+                for name in names:
+                    _write_png(src / name)
+            except OSError:
+                self.skipTest("Filesystem does not support special filenames")
+            out = tmp / "out"
+            args = _make_args(out, sourcedir=str(src))
+            with patch.object(ocr, "get_detector", return_value=_StubDetector()), patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ):
+                ocr.process(args)
+            for name in names:
+                stem = Path(name).stem
+                with self.subTest(name=name):
+                    xml_root = ET.parse(out / f"{stem}.xml").getroot()
+                    self.assertEqual(xml_root.find("PAGE").get("IMAGENAME"), name)
+                    payload = json.loads((out / f"{stem}.json").read_text(encoding="utf-8"))
+                    self.assertEqual(payload["imginfo"]["img_name"], name)
+                    lines = [
+                        line
+                        for line in (out / f"{stem}.txt").read_text(encoding="utf-8").splitlines()
+                        if line
+                    ]
+                    self.assertTrue(lines)
+                    self.assertEqual(set(lines), {"TESTLINE"})
+
+    def test_run_ocr_on_image_array_accepts_special_inputname(self):
+        import xml.etree.ElementTree as ET
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img = np.full((120, 160, 3), 255, dtype=np.uint8)
+            for inputname in ("page.png", "a<b.png", 'a"b.png', "a&b.png", "a&amp;b.png"):
+                with self.subTest(inputname=inputname):
+                    page_result = ocr._run_ocr_on_image_array(
+                        detector=_StubDetector(),
+                        recognizer30=_StubRecognizer("TESTLINE"),
+                        recognizer50=_StubRecognizer("TESTLINE"),
+                        recognizer100=_StubRecognizer("TESTLINE"),
+                        inputname=inputname,
+                        img=img,
+                        outputpath=tmpdir,
+                        save_viz=False,
+                    )
+                    root = ET.fromstring("<OCRDATASET>" + page_result["page_xml"] + "</OCRDATASET>")
+                    self.assertEqual(root.find("PAGE").get("IMAGENAME"), inputname)
+
+
 if __name__ == "__main__":
     unittest.main()
