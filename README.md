@@ -1,9 +1,11 @@
-# NDLOCR-Liteアプリケーションのリポジトリ
+# NDLOCR-Lite（マルチベンダー GPU 対応フォーク）
+**（GPU 対応版）NVIDIA CUDA / AMD Radeon (WebGPU・MIGraphX) / Intel Arc (OpenVINO・WebGPU) での GPU 推論、PARSeq 動的バッチ化、CPU/GPU 3段パイプライン並列化に対応しています。設定手順とベンチマークは [GPU セットアップガイド](./docs/GPU_SETUP.md) をご覧ください。**
+
 **（2026/11/24追記）v2から読書バリアフリー機能を強化しています。また、PyPIによるインストールに対応しています。**
 
 **（2026/04/24追記）v1.2から手書き文字の認識等を強化しています。**
 
-NDLOCR-Liteを利用してテキスト化を実行するためのアプリケーションを提供するリポジトリです。
+NDLOCR-Liteを利用してテキスト化を実行するためのアプリケーションを提供するリポジトリです（上流: [ndl-lab/ndlocr-lite](https://github.com/ndl-lab/ndlocr-lite)）。
 
 NDLOCR-Liteは、[NDLOCR](https://github.com/ndl-lab/ndlocr_cli)の軽量版を目指して開発したOCRであり、ノートパソコン等の一般的な家庭用コンピュータやOS環境で、図書や雑誌といった資料のデジタル化画像からテキストデータが作成できるOCRです。
 
@@ -59,12 +61,22 @@ python3 ocr.py --sourceimg digidepo_1287221_00000002.jpg --output tmpdir
 
 uv(<https://github.com/astral-sh/uv>)をお使いの環境であれば、以下のようにしても導入・実行可能です。この場合、「ndlocr-lite」というコマンドから実行できます。
 
-導入方法
+導入方法（GPU 構成の詳細は [GPU セットアップガイド](./docs/GPU_SETUP.md) を参照してください）
 
 ```bash
-git clone https://github.com/ndl-lab/ndlocr-lite
+git clone https://github.com/melmaron/ndlocr-lite
 cd ndlocr-lite
 uv tool install .
+```
+
+GPU を利用する場合は用途に応じた要件ファイルを指定してください:
+
+```bash
+# 汎用 GPU（AMD Radeon / Intel Arc: WebGPU + OpenVINO）
+pip install -r requirements-gpu-generic.txt
+
+# NVIDIA CUDA（PyPI 既定は CUDA 13 系。CUDA 12 系は GPU_SETUP.md 参照）
+pip uninstall -y onnxruntime && pip install -r requirements-cuda.txt
 ```
 
 実行例
@@ -103,9 +115,15 @@ OCR結果を保存する出力先ディレクトリを相対パスまたは絶�
 
 `--viz True`を指定することで、文字認識箇所を青枠で表示した画像を出力先ディレクトリに出力する。
 
-#### `--device`オプション（ベータ）
+#### `--device` / `--device-id` / `--batch-size` / `--strict-device` / `--check-device` オプション
 
-対応GPUを搭載したサーバかつonnxruntime-gpuがインストールされている環境に限り、`--device cuda`を指定することでGPUを利用した処理に切り替える。
+推論エンジンと GPU 並列実行を制御します（詳細: [GPU セットアップガイド](./docs/GPU_SETUP.md)）。
+
+- `--device`（既定: `auto`）: `auto`, `cuda`, `migraphx`, `rocm`, `openvino`, `webgpu`, `dml`, `cpu` から指定します。`auto` では環境に応じて CUDA > MIGraphX > ROCm > OpenVINO GPU > WebGPU > DML > CPU の順で自動選択し、利用不可時は `cpu` へフォールバックします。
+- `--device-id`（既定: `0`）: マルチ GPU 環境で使用するデバイス番号を指定します。
+- `--batch-size`（既定: CUDA/MIGraphX/ROCm 時 `32`、OpenVINO/WebGPU/DML 時 `16`、CPU 時 `1`、`0` で自動）: PARSeq 動的バッチ認識の最大バッチサイズを指定します。
+- `--strict-device`: 指定した GPU バックエンドの初期化・実行に失敗した場合、CPU フォールバックせずエラーで終了します。
+- `--check-device`: 利用可能な EP・検出 GPU デバイス一覧・`--device auto` の選択結果を表示して終了します。
 
 #### `--json-only`オプション
 `--json-only`を指定することで、出力形式のうちjsonのみを出力する。

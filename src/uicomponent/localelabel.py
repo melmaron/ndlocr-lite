@@ -211,6 +211,34 @@ TRANSLATIONS = {
         "ja":"アクセシビリティ用出力、文字の正規化、表の構造化",
         "en":"Accessible output, character normalization, and table structure"
     },
+    "customize_execution_title":{
+        "ja":"実行環境・GPU高速化",
+        "en":"Execution Engine & GPU Acceleration"
+    },
+    "customize_execution_explain":{
+        "ja":"推論デバイス（自動 / CUDA / Radeon / Arc / CPU）と並列バッチサイズを設定します。変更後すぐモデルを再読み込みします。",
+        "en":"Configure inference device (Auto / CUDA / Radeon / Arc / CPU) and batch size. Models reload automatically when changed."
+    },
+    "customize_device_label":{
+        "ja":"実行デバイス",
+        "en":"Execution device"
+    },
+    "customize_batch_size_label":{
+        "ja":"バッチサイズ",
+        "en":"Batch size"
+    },
+    "customize_device_id_label":{
+        "ja":"GPU ID",
+        "en":"GPU ID"
+    },
+    "engine_status_prefix":{
+        "ja":"実行エンジン",
+        "en":"Engine"
+    },
+    "engine_status_loading":{
+        "ja":"実行エンジン: 読み込み中…",
+        "en":"Engine: Loading…"
+    },
     "customize_save":{
         "ja":"設定を保存",
         "en":"Save settings"

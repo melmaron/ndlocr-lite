@@ -52,8 +52,8 @@ class SetVersionTest(unittest.TestCase):
     def test_cli_version_is_development_release(self):
         result, project, version_file, _ = self.run_version("1.5.0", "--dev")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('version = "1.5.0.dev0"', project)
-        self.assertIn('__version__ = "1.5.0.dev0"', version_file)
+        self.assertIn('version = "1.5.0.dev3"', project)
+        self.assertIn('__version__ = "1.5.0.dev3"', version_file)
         self.assertIn('[tool.example]\nversion = "unchanged"', project)
 
     def test_invalid_dev_versions_do_not_modify_files(self):

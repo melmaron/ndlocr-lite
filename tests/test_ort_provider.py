@@ -1,0 +1,186 @@
+import contextlib
+import io
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+import ort_provider
+
+
+BUNDLED_PARSEQ30 = ROOT / "src" / "model" / "parseq-ndl-24x256-30-tiny-499epoch-261124.onnx"
+
+
+class OrtProviderTest(unittest.TestCase):
+    def setUp(self):
+        ort_provider._WARNED_KEYS.clear()
+
+    def test_choices_priority_and_normalization(self):
+        self.assertIn("auto", ort_provider.DEVICE_CHOICES)
+        self.assertEqual(
+            ort_provider.AUTO_PRIORITY,
+            ("cuda", "migraphx", "rocm", "openvino", "webgpu", "dml", "cpu"),
+        )
+        self.assertEqual(ort_provider.normalize_device_name("DirectML"), "dml")
+        self.assertEqual(ort_provider.normalize_device_name("OV"), "openvino")
+        self.assertEqual(ort_provider.normalize_device_name("GPU"), "auto")
+        self.assertEqual(ort_provider.normalize_device_name(""), "auto")
+        self.assertEqual(ort_provider.normalize_device_name("  CUDA "), "cuda")
+
+    def test_deform_conv_version_check(self):
+        self.assertTrue(ort_provider.ort_supports_deform_conv("1.31.1"))
+        self.assertTrue(ort_provider.ort_supports_deform_conv("1.25.0"))
+        self.assertFalse(ort_provider.ort_supports_deform_conv("1.24.4"))
+
+    def test_parallel_model_init_policy(self):
+        self.assertTrue(ort_provider.should_parallelize_model_init("cpu"))
+        for dev in ("auto", "cuda", "migraphx", "rocm", "openvino", "webgpu", "dml"):
+            self.assertFalse(ort_provider.should_parallelize_model_init(dev))
+
+    def test_openvino_cpu_only_ep_device_not_treated_as_gpu(self):
+        ov_cpu = SimpleNamespace(
+            ep_name="OpenVINOExecutionProvider",
+            ep_metadata={"ov_device": "CPU"},
+            device=SimpleNamespace(type="CPU", vendor="Intel", device_id=0),
+        )
+        ov_gpu = SimpleNamespace(
+            ep_name="OpenVINOExecutionProvider",
+            ep_metadata={"ov_device": "GPU.0"},
+            device=SimpleNamespace(type="GPU", vendor="Intel", device_id=0),
+        )
+        webgpu_dev = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="AMD", device_id=0),
+        )
+        self.assertEqual(
+            ort_provider._find_plugin_devices_for_backend("openvino", [ov_cpu]),
+            [],
+        )
+        self.assertEqual(
+            ort_provider._find_plugin_devices_for_backend("openvino", [ov_cpu, ov_gpu]),
+            [ov_gpu],
+        )
+        self.assertEqual(
+            ort_provider._find_plugin_devices_for_backend("webgpu", [ov_cpu, webgpu_dev]),
+            [webgpu_dev],
+        )
+
+    def test_loaded_openvino_plugin_without_gpu_does_not_hijack_auto(self):
+        ov_cpu = SimpleNamespace(
+            ep_name="OpenVINOExecutionProvider",
+            ep_metadata={"ov_device": "CPU"},
+            device=SimpleNamespace(type="CPU", vendor="Intel", device_id=0),
+        )
+        webgpu_dev = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="GPU", device_id=0),
+        )
+        with patch.dict(
+            ort_provider._REGISTERED_PLUGINS,
+            {"openvino_ep": "/fake/ov.so", "webgpu": "/fake/wgpu.so"},
+            clear=True,
+        ), patch.object(
+            ort_provider, "register_plugin_eps", return_value=dict(ort_provider._REGISTERED_PLUGINS)
+        ), patch.object(
+            ort_provider.ort,
+            "get_available_providers",
+            return_value=["CPUExecutionProvider", "OpenVINOExecutionProvider", "WebGpuExecutionProvider"],
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[ov_cpu, webgpu_dev]
+        ):
+            avail = ort_provider.detect_available_backends()
+            self.assertFalse(avail["openvino"]["available"])
+            self.assertIn("no Intel GPU device detected", avail["openvino"]["detail"])
+            self.assertTrue(avail["webgpu"]["available"])
+            self.assertEqual(ort_provider.resolve_auto_backend_name(), "webgpu")
+            with self.assertRaisesRegex(RuntimeError, "no Intel GPU device detected"):
+                ort_provider._create_session_for_backend(
+                    BUNDLED_PARSEQ30,
+                    "openvino",
+                    device_id=0,
+                    cpu_single_thread=False,
+                )
+
+    def test_auto_priority_resolution_with_mocked_backends(self):
+        mock_avail = {
+            "cuda": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "migraphx": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "rocm": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "openvino": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "webgpu": {"available": True, "mode": "plugin", "devices": ["WebGPU"], "detail": "WebGPU"},
+            "dml": {"available": True, "mode": "monolithic", "devices": ["DML"], "detail": "DML"},
+            "cpu": {"available": True, "mode": "builtin", "devices": ["CPU"], "detail": "CPU"},
+        }
+        with patch.object(ort_provider, "detect_available_backends", return_value=mock_avail):
+            self.assertEqual(ort_provider.resolve_auto_backend_name(), "webgpu")
+
+        mock_avail["openvino"]["available"] = True
+        with patch.object(ort_provider, "detect_available_backends", return_value=mock_avail):
+            self.assertEqual(ort_provider.resolve_auto_backend_name(), "openvino")
+
+    def test_create_cpu_session_on_bundled_model(self):
+        if not BUNDLED_PARSEQ30.is_file():
+            self.skipTest("Bundled PARSeq model not present")
+        session, profile = ort_provider.create_inference_session(
+            BUNDLED_PARSEQ30,
+            device="cpu",
+            cpu_single_thread=True,
+            model_label="PARSeq-30",
+        )
+        self.assertIn("CPUExecutionProvider", session.get_providers())
+        self.assertEqual(profile.active_backend, "cpu")
+        self.assertFalse(profile.fallback_occurred)
+        self.assertEqual(profile.default_batch_size, 1)
+        self.assertTrue(profile.parallel_session_init)
+        self.assertTrue(profile.concurrent_session_run)
+
+    def test_unavailable_backend_falls_back_or_raises_strictly(self):
+        if not BUNDLED_PARSEQ30.is_file():
+            self.skipTest("Bundled PARSeq model not present")
+        with patch.object(
+            ort_provider,
+            "_create_session_for_backend",
+            side_effect=[RuntimeError("no such backend"), (object(), ["CPUExecutionProvider"])],
+        ):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                _, profile = ort_provider.create_inference_session(
+                    BUNDLED_PARSEQ30,
+                    device="migraphx",
+                    strict_device=False,
+                    model_label="PARSeq-30",
+                )
+            self.assertEqual(profile.active_backend, "cpu")
+            self.assertEqual(profile.requested_device, "migraphx")
+            self.assertTrue(profile.fallback_occurred)
+            self.assertIn("migraphx", stderr.getvalue())
+
+        with patch.object(
+            ort_provider,
+            "_create_session_for_backend",
+            side_effect=RuntimeError("no such backend"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Requested device 'migraphx' failed"):
+                ort_provider.create_inference_session(
+                    BUNDLED_PARSEQ30,
+                    device="migraphx",
+                    strict_device=True,
+                    model_label="PARSeq-30",
+                )
+
+    def test_format_device_diagnostics_contains_summary(self):
+        report = ort_provider.format_device_diagnostics()
+        self.assertIn("NDLOCR-Lite GPU / ONNX Runtime Diagnostics", report)
+        self.assertIn("TableCenterNet (DeformConv, ORT>=1.25):", report)
+        self.assertIn("Selected by '--device auto':", report)
+
+
+if __name__ == "__main__":
+    unittest.main()

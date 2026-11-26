@@ -601,19 +601,24 @@ def save_visualization(image: np.ndarray, cells: List[Mapping[str, object]], pat
 # ONNX Runtime
 # ---------------------------------------------------------------------------
 
-def make_session(model_path: Path, device: str) -> ort.InferenceSession:
-    available = ort.get_available_providers()
-    if device == "cuda":
-        if "CUDAExecutionProvider" not in available:
-            raise RuntimeError(
-                "CUDAExecutionProvider is unavailable. Install a compatible onnxruntime-gpu build."
-            )
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    else:
-        providers = ["CPUExecutionProvider"]
+def make_session_with_profile(
+    model_path: Path,
+    device: str,
+    *,
+    device_id: int = 0,
+    strict_device: bool = False,
+):
+    from ort_provider import create_inference_session
 
     try:
-        return ort.InferenceSession(str(model_path), providers=providers)
+        return create_inference_session(
+            model_path,
+            device=device,
+            device_id=device_id,
+            strict_device=strict_device,
+            cpu_single_thread=False,
+            model_label="TableCenterNet",
+        )
     except Exception as exc:
         msg = str(exc)
         if "DeformConv" in msg or "NOT_IMPLEMENTED" in msg or "No Op registered" in msg:
@@ -624,6 +629,21 @@ def make_session(model_path: Path, device: str) -> ort.InferenceSession:
                 f"Original error: {msg}"
             ) from exc
         raise
+
+
+def make_session(
+    model_path: Path,
+    device: str,
+    device_id: int = 0,
+    strict_device: bool = False,
+) -> ort.InferenceSession:
+    session, _ = make_session_with_profile(
+        model_path,
+        device,
+        device_id=device_id,
+        strict_device=strict_device,
+    )
+    return session
 
 
 def fixed_input_hw(session: ort.InferenceSession) -> Tuple[str, int, int]:
@@ -668,7 +688,7 @@ class TableCenterNetRecognizer:
     def __init__(
         self,
         model_path: str | Path,
-        device: str = "cpu",
+        device: str = "auto",
         decoder: str = "official",
         center_k: int = DEFAULT_CENTER_K,
         corner_k: int = DEFAULT_CORNER_K,
@@ -676,11 +696,15 @@ class TableCenterNetRecognizer:
         corner_thresh: float = DEFAULT_CORNER_THRESH,
         use_nms: bool = False,
         iou_thresh: float = DEFAULT_IOU_THRESH,
+        device_id: int = 0,
+        strict_device: bool = False,
     ) -> None:
         if decoder not in {"simple", "official"}:
             raise ValueError("decoder must be 'simple' or 'official'")
         self.model_path = Path(model_path)
-        self.device = device
+        self.device = device or "auto"
+        self.device_id = int(device_id or 0)
+        self.strict_device = bool(strict_device)
         self.decoder = decoder
         self.center_k = int(center_k)
         self.corner_k = int(corner_k)
@@ -689,9 +713,11 @@ class TableCenterNetRecognizer:
         self.use_nms = bool(use_nms)
         self.iou_thresh = float(iou_thresh)
         self._session: Optional[ort.InferenceSession] = None
+        self.backend_profile = None
         self._input_name: Optional[str] = None
         self._input_h: Optional[int] = None
         self._input_w: Optional[int] = None
+        self._input_dtype = np.float32
 
     @property
     def loaded(self) -> bool:
@@ -707,12 +733,20 @@ class TableCenterNetRecognizer:
             return
         if not self.model_path.exists():
             raise FileNotFoundError(f"TableCenterNet model is not found: {self.model_path}")
-        session = make_session(self.model_path, self.device)
+        session, profile = make_session_with_profile(
+            self.model_path,
+            self.device,
+            device_id=self.device_id,
+            strict_device=self.strict_device,
+        )
         input_name, input_h, input_w = fixed_input_hw(session)
+        in_type = str(session.get_inputs()[0].type)
         self._session = session
+        self.backend_profile = profile
         self._input_name = input_name
         self._input_h = input_h
         self._input_w = input_w
+        self._input_dtype = np.float16 if "float16" in in_type else np.float32
 
     def recognize_rgb(self, image_rgb: np.ndarray) -> List[Dict[str, object]]:
         """Infer table cells from an RGB crop and return crop-local coordinates."""
@@ -726,6 +760,8 @@ class TableCenterNetRecognizer:
         # The official TableCenterNet preprocessing consumes OpenCV BGR.
         image_bgr = np.ascontiguousarray(image_rgb[:, :, ::-1])
         tensor, meta = preprocess(image_bgr, self._input_h, self._input_w, padding=0)
+        if self._input_dtype != np.float32:
+            tensor = tensor.astype(self._input_dtype)
         out = run_onnx(self._session, self._input_name, tensor)
         _, _, out_h, out_w = out["hm"].shape
         meta.output_height = int(out_h)

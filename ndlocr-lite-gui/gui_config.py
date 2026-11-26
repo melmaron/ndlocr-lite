@@ -14,6 +14,9 @@ GUI_DEFAULT_CONFIG = {
     'result_markdown_display': False,
     'selected_output_path': None,
     'visualize': True,
+    'device': 'auto',
+    'device_id': 0,
+    'batch_size': 0,
 }
 
 

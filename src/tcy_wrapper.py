@@ -9,9 +9,10 @@ Usage:
     text = recognizer.read(img)  # same interface as PARSEQ
 """
 
+from typing import List, Optional, Sequence, Tuple
+
 import cv2
 import numpy as np
-from typing import Tuple, List
 
 
 def _softmax(x, axis=-1):
@@ -52,6 +53,18 @@ class TateChuYokoWrapper:
         self.seg_min_gap = tcy_seg_min_gap
         self.ink_threshold_ratio = tcy_ink_threshold_ratio
 
+    @property
+    def batch_size(self) -> int:
+        return int(getattr(self._rec, "batch_size", 1))
+
+    @property
+    def dynamic_batch(self) -> bool:
+        return bool(getattr(self._rec, "dynamic_batch", False))
+
+    @property
+    def backend_profile(self):
+        return getattr(self._rec, "backend_profile", None)
+
     def read(self, img: np.ndarray) -> str:
         if img is None or img.size == 0:
             return ""
@@ -59,6 +72,150 @@ class TateChuYokoWrapper:
         if h > w:
             return self._detect_and_fix_tatechuyoko(img)
         return self._rec.read(img)
+
+    def read_batch(
+        self,
+        imgs: Sequence[np.ndarray],
+        batch_size: Optional[int] = None,
+    ) -> List[str]:
+        """Batch-process lines with full tate-chuu-yoko detection and zero degradation."""
+        if not imgs:
+            return []
+
+        results = [""] * len(imgs)
+        horiz_indices: List[int] = []
+        horiz_imgs: List[np.ndarray] = []
+        vert_indices: List[int] = []
+        vert_imgs: List[np.ndarray] = []
+
+        for idx, img in enumerate(imgs):
+            if img is None or img.size == 0:
+                continue
+            h, w = img.shape[:2]
+            if h > w:
+                vert_indices.append(idx)
+                vert_imgs.append(img)
+            else:
+                horiz_indices.append(idx)
+                horiz_imgs.append(img)
+
+        if horiz_imgs:
+            horiz_texts = self._rec.read_batch(horiz_imgs, batch_size=batch_size)
+            for idx, text in zip(horiz_indices, horiz_texts):
+                results[idx] = text
+
+        if not vert_imgs:
+            return results
+
+        # Step 1: full-line raw recognition across all vertical lines (no space stripping, matching _read_with_confidence)
+        full_texts = self._rec.read_batch_raw(
+            vert_imgs,
+            batch_size=batch_size,
+            auto_rotate=True,
+            clean_punctuation=False,
+        )
+
+        rot_false_crops: List[np.ndarray] = []
+        rot_true_crops: List[np.ndarray] = []
+        # Each item in pending: (orig_idx, full_text, list of (is_rot_false, crop_idx))
+        pending: List[Tuple[int, str, List[Tuple[bool, int]]]] = []
+
+        for idx, img, full_text in zip(vert_indices, vert_imgs, full_texts):
+            if not full_text:
+                results[idx] = full_text
+                continue
+            h, w = img.shape[:2]
+            blocks = self._segment_blocks(img)
+            if not blocks or w < self.min_line_width:
+                results[idx] = full_text
+                continue
+
+            tcy_flags = self._compute_tcy_flags(img, blocks, h, w)
+            if not any(tcy_flags):
+                results[idx] = full_text
+                continue
+
+            segment_refs: List[Tuple[bool, int]] = []
+            i = 0
+            n = len(blocks)
+            while i < n:
+                if tcy_flags[i]:
+                    y_start, y_end = blocks[i]
+                    block_height = y_end - y_start
+                    ocr_margin = max(5, int(block_height * self.ocr_margin_ratio))
+                    y0 = max(0, y_start - ocr_margin)
+                    y1 = min(h, y_end + ocr_margin)
+                    block_img = img[y0:y1, :, :] if img.ndim == 3 else img[y0:y1, :]
+                    if block_img.ndim == 2:
+                        block_img = np.stack([block_img] * 3, axis=-1)
+                    segment_refs.append((False, len(rot_false_crops)))
+                    rot_false_crops.append(block_img)
+                    i += 1
+                else:
+                    group_start = i
+                    while i < n and not tcy_flags[i]:
+                        i += 1
+                    crop_y0 = blocks[group_start - 1][1] if (group_start > 0 and tcy_flags[group_start - 1]) else blocks[group_start][0]
+                    crop_y1 = blocks[i][0] if (i < n and tcy_flags[i]) else blocks[i - 1][1]
+                    group_img = img[crop_y0:crop_y1, :, :] if img.ndim == 3 else img[crop_y0:crop_y1, :]
+                    if group_img.shape[0] > 0 and group_img.shape[1] > 0:
+                        segment_refs.append((True, len(rot_true_crops)))
+                        rot_true_crops.append(group_img)
+
+            pending.append((idx, full_text, segment_refs))
+
+        rot_false_texts = (
+            self._rec.read_batch_raw(
+                rot_false_crops,
+                batch_size=batch_size,
+                auto_rotate=False,
+                clean_punctuation=False,
+            )
+            if rot_false_crops
+            else []
+        )
+        rot_true_texts = (
+            self._rec.read_batch_raw(
+                rot_true_crops,
+                batch_size=batch_size,
+                auto_rotate=True,
+                clean_punctuation=False,
+            )
+            if rot_true_crops
+            else []
+        )
+
+        for idx, full_text, segment_refs in pending:
+            parts = [
+                rot_true_texts[ref_idx] if use_rot else rot_false_texts[ref_idx]
+                for use_rot, ref_idx in segment_refs
+            ]
+            block_text = "".join(parts)
+            results[idx] = block_text if len(block_text) > len(full_text) else full_text
+
+        return results
+
+    def _compute_tcy_flags(
+        self,
+        img: np.ndarray,
+        blocks: List[Tuple[int, int]],
+        h: int,
+        w: int,
+    ) -> List[bool]:
+        tcy_flags: List[bool] = []
+        for y_start, y_end in blocks:
+            block_height = y_end - y_start
+            det_margin = max(2, int(block_height * self.det_margin_ratio))
+            y0 = max(0, y_start - det_margin)
+            y1 = min(h, y_end + det_margin)
+            block_img = img[y0:y1, :, :] if img.ndim == 3 else img[y0:y1, :]
+            is_tcy = (
+                block_height >= self.seg_min_gap
+                and self._count_horizontal_components(block_img) >= self.min_components
+                and block_height <= w * self.max_aspect_ratio
+            )
+            tcy_flags.append(is_tcy)
+        return tcy_flags
 
     def _read_with_confidence(self, img: np.ndarray, rotate: bool = True) -> Tuple[str, List[float]]:
         if img is None or img.size == 0:
@@ -81,11 +238,16 @@ class TateChuYokoWrapper:
 
     def _preprocess_no_rotation(self, img: np.ndarray) -> np.ndarray:
         rec = self._rec
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
         resized = cv2.resize(img, (rec.input_width, rec.input_height), interpolation=cv2.INTER_LINEAR)
         input_image = np.ascontiguousarray(resized[:, :, ::-1]).astype(np.float32)
         input_image /= 127.5
         input_image -= 1.0
         input_image = input_image.transpose(2, 0, 1)
+        dtype = getattr(rec, "input_dtype", np.float32)
+        if dtype != np.float32:
+            input_image = input_image.astype(dtype)
         return input_image[np.newaxis, :, :, :]
 
     def _segment_blocks(self, img: np.ndarray) -> List[Tuple[int, int]]:
@@ -141,25 +303,14 @@ class TateChuYokoWrapper:
 
     def _detect_and_fix_tatechuyoko(self, img: np.ndarray) -> str:
         h, w = img.shape[:2]
-        full_text, full_conf = self._read_with_confidence(img, rotate=True)
+        full_text, _ = self._read_with_confidence(img, rotate=True)
         if not full_text:
             return full_text
         blocks = self._segment_blocks(img)
         if not blocks or w < self.min_line_width:
             return full_text
 
-        tcy_flags: List[bool] = []
-        for y_start, y_end in blocks:
-            block_height = y_end - y_start
-            det_margin = max(2, int(block_height * self.det_margin_ratio))
-            y0 = max(0, y_start - det_margin)
-            y1 = min(h, y_end + det_margin)
-            block_img = img[y0:y1, :, :] if img.ndim == 3 else img[y0:y1, :]
-            is_tcy = (block_height >= self.seg_min_gap
-                      and self._count_horizontal_components(block_img) >= self.min_components
-                      and block_height <= w * self.max_aspect_ratio)
-            tcy_flags.append(is_tcy)
-
+        tcy_flags = self._compute_tcy_flags(img, blocks, h, w)
         if not any(tcy_flags):
             return full_text
 

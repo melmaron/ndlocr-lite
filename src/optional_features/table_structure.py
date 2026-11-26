@@ -46,10 +46,12 @@ class TableStructureFeature:
     def create_recognizer(self, args):
         return self.engine.TableCenterNetRecognizer(
             model_path=args.table_weights,
-            device=args.device,
+            device=getattr(args, 'device', 'auto'),
             decoder=args.table_decoder,
             center_thresh=args.table_center_thresh,
             corner_thresh=args.table_corner_thresh,
+            device_id=getattr(args, 'device_id', 0),
+            strict_device=getattr(args, 'strict_device', False),
         )
 
     def infer(self, image, page_result, recognizer, crop_padding=None):

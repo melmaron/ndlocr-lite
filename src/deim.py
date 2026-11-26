@@ -1,11 +1,11 @@
 from PIL import Image, ImageDraw
-import time
 import yaml
-import onnxruntime
 import numpy as np
-import cv2
 from typing import Tuple, List
 import xml.etree.ElementTree as ET
+
+from ort_provider import create_inference_session
+
 
 class DEIM:
     def __init__(self,
@@ -15,14 +15,18 @@ class DEIM:
                  score_threshold: float = 0.1,
                  conf_threshold: float = 0.1,
                  iou_threshold: float = 0.4,
-                 device: str = "CPU",
-                 overlap_threshold: float = 0.9) -> None:
+                 device: str = "auto",
+                 overlap_threshold: float = 0.9,
+                 device_id: int = 0,
+                 strict_device: bool = False) -> None:
         if not 0.0 <= overlap_threshold <= 1.0:
             raise ValueError("overlap_threshold must be between 0 and 1")
         self.model_path = model_path
         self.class_mapping_path = class_mapping_path
         self.image_width, self.image_height = original_size
-        self.device = device
+        self.device = device or "auto"
+        self.device_id = int(device_id or 0)
+        self.strict_device = bool(strict_device)
         self.score_threshold = score_threshold
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
@@ -34,22 +38,26 @@ class DEIM:
         self._inv_std = np.reciprocal(
             np.array([0.229, 0.224, 0.225], dtype=np.float32)
         )
+        self.backend_profile = None
         self.create_session()
 
     def create_session(self) -> None:
-        opt_session = onnxruntime.SessionOptions()
-        opt_session.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        #opt_session.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
-        #ExecutionMode.ORT_PARALLEL
-        #opt_session.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
-        providers = ['CPUExecutionProvider']
-        if self.device.casefold() == "cuda":
-            providers = ['CUDAExecutionProvider','CPUExecutionProvider']
-        session = onnxruntime.InferenceSession(self.model_path,opt_session, providers=providers)
+        session, profile = create_inference_session(
+            self.model_path,
+            device=self.device,
+            device_id=self.device_id,
+            strict_device=self.strict_device,
+            cpu_single_thread=False,
+            model_label="DEIM",
+        )
         self.session = session
+        self.backend_profile = profile
         self.model_inputs = self.session.get_inputs()
         self.input_names = [self.model_inputs[i].name for i in range(len(self.model_inputs))]
         self.input_shape = self.model_inputs[0].shape
+        self.input_dtype = (
+            np.float16 if "float16" in str(self.model_inputs[0].type) else np.float32
+        )
         self.model_output = self.session.get_outputs()
         self.output_names = [self.model_output[i].name for i in range(len(self.model_output))]
         self.input_height, self.input_width = self.input_shape[2:]
@@ -63,21 +71,28 @@ class DEIM:
         else:
             self.markdown_styles = {}
 
-    def preprocess(self, img: np.ndarray) -> np.ndarray:
-        max_wh=max(img.shape[0],img.shape[1])
-        paddedimg=np.zeros((max_wh,max_wh,3),dtype=np.uint8)
-        paddedimg[:img.shape[0],:img.shape[1],:]=img
-        self.image_width=max_wh
-        self.image_height=max_wh
-        #resized=cv2.resize(paddedimg,(self.input_width, self.input_height),interpolation=cv2.INTER_AREA)
+    def preprocess_with_meta(self, img: np.ndarray) -> Tuple[np.ndarray, int]:
+        """Preprocess image without mutating instance dimensions (safe for prefetch)."""
+        max_wh = max(img.shape[0], img.shape[1])
+        paddedimg = np.zeros((max_wh, max_wh, 3), dtype=np.uint8)
+        paddedimg[:img.shape[0], :img.shape[1], :] = img
         pil_image = Image.fromarray(paddedimg)
         pil_resized = pil_image.resize((self.input_width, self.input_height))
         input_image = np.asarray(pil_resized, dtype=np.float32)
         input_image *= np.float32(1.0 / 255.0)
         input_image -= self._mean
         input_image *= self._inv_std
-        return np.ascontiguousarray(input_image.transpose(2,0,1)[np.newaxis, :, :, :])
-    
+        tensor = np.ascontiguousarray(input_image.transpose(2, 0, 1)[np.newaxis, :, :, :])
+        if self.input_dtype != np.float32:
+            tensor = tensor.astype(self.input_dtype)
+        return tensor, max_wh
+
+    def preprocess(self, img: np.ndarray) -> np.ndarray:
+        tensor, max_wh = self.preprocess_with_meta(img)
+        self.image_width = max_wh
+        self.image_height = max_wh
+        return tensor
+
     def xywh2xyxy(self, x):
         # Convert bounding box (x, y, w, h) to bounding box (x1, y1, x2, y2)
         y = np.copy(x)
@@ -85,10 +100,10 @@ class DEIM:
         y[..., 1] = x[..., 1] - x[..., 3] / 2
         y[..., 2] = x[..., 0] + x[..., 2] / 2
         y[..., 3] = x[..., 1] + x[..., 3] / 2
-        return y 
-    
+        return y
+
     def postprocess(self, outputs):
-        
+
         if len(outputs)==6:
             class_ids,bboxes,scores,char_counts,markdown_style,_=outputs
             class_ids=np.asarray(class_ids).reshape(-1)
@@ -117,9 +132,9 @@ class DEIM:
         char_counts = char_counts[keep]
         markdown_style = markdown_style[keep]
         scales = np.array([
-            self.image_width / self.input_width, 
-            self.image_height / self.input_width, 
-            self.image_width / self.input_width, 
+            self.image_width / self.input_width,
+            self.image_height / self.input_width,
+            self.image_width / self.input_width,
             self.image_height / self.input_width
         ], dtype=np.float32)
         boxes = (predictions[:, :4] * scales).astype(np.int32)
@@ -136,8 +151,6 @@ class DEIM:
                 "pred_markdown_style":m_style,
                 "class_name": self.classes[class_index]#"line_main"
             })
-        #print(len(detections))
-        #print(char_counts)
         return self._suppress_overlapping_regions(detections)
 
     def _suppress_overlapping_regions(self, detections):
@@ -173,16 +186,27 @@ class DEIM:
             else:
                 kept.append(index)
         return [d for i, d in enumerate(detections) if i not in suppressed]
-    
+
     def get_label_name(self, class_id: int) -> str:
         return self.classes[class_id]
-        
-    def detect(self, img: np.ndarray) -> List:
-        input_tensor = self.preprocess(img)
-        #print(self.input_shape)
-        outputs = self.session.run(self.output_names, {self.input_names[0]: input_tensor,self.input_names[1]:np.array([[self.input_height, self.input_width]],np.int64)})
+
+    def detect_from_preprocessed(self, input_tensor: np.ndarray, max_wh: int) -> List:
+        """Run inference on a pre-normalized tensor produced by :meth:`preprocess_with_meta`."""
+        self.image_width = max_wh
+        self.image_height = max_wh
+        outputs = self.session.run(
+            self.output_names,
+            {
+                self.input_names[0]: input_tensor,
+                self.input_names[1]: np.array([[self.input_height, self.input_width]], np.int64),
+            },
+        )
         return self.postprocess(outputs)
-    
+
+    def detect(self, img: np.ndarray) -> List:
+        input_tensor, max_wh = self.preprocess_with_meta(img)
+        return self.detect_from_preprocessed(input_tensor, max_wh)
+
     def draw_detections(self, npimg: np.ndarray, detections: List):
         pil_image = Image.fromarray(npimg)
         draw = ImageDraw.Draw(pil_image)
@@ -196,7 +220,7 @@ class DEIM:
             # 画像にバウンディングボックスを描画
             draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
         return pil_image
-    
+
     def drawxml_detections(self, npimg: np.ndarray, xmlstr: str,categories:dict,outputimgpath:str):
         root = ET.fromstring(xmlstr)
         pil_image = Image.fromarray(npimg)
@@ -218,4 +242,3 @@ class DEIM:
             color = self.colorlist[class_id]
             draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
         pil_image.save(outputimgpath)
-            

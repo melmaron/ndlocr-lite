@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "UTF-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pytest>=8.0" build
+
+      - name: Compile Python modules
+        run: |
+          python -m compileall -q src ndlocr-lite-gui tests
+
+      - name: Run unit and CPU OCR equivalence tests (Linux)
+        if: runner.os != 'Windows'
+        env:
+          PYTHONPATH: src:ndlocr-lite-gui
+        run: |
+          pytest tests ndlocr-lite-gui/tests -v
+
+      - name: Run unit and CPU OCR equivalence tests (Windows)
+        if: runner.os == 'Windows'
+        env:
+          PYTHONPATH: src;ndlocr-lite-gui
+        run: |
+          pytest tests ndlocr-lite-gui/tests -v
+
+      - name: Build package and smoke-test CLI entry point
+        run: |
+          python -m build --wheel --outdir dist
+          pip install --no-deps --force-reinstall dist/*.whl
+          ndlocr-lite --check-device
+          ndlocr-lite --help

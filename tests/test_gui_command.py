@@ -63,7 +63,7 @@ class GuiCommandTest(unittest.TestCase):
         self.assertTrue((self.app.ASSETS_DIR / "icon.png").is_file())
 
     def test_packaged_resource_paths(self):
-        self.assertEqual(self.app.SOURCE_DIR, ROOT)
+        self.assertEqual(self.app.SOURCE_DIR, ROOT / "src")
         self.assertEqual(self.app.APP_DIR, ROOT / "ndlocr-lite-gui")
         self.assertEqual(self.app.build_default_config()["langcode"], "ja")
 
@@ -71,7 +71,7 @@ class GuiCommandTest(unittest.TestCase):
         args = self.app.parse_gui_args(["--flet-host-option"])
         self.assertEqual(
             args.det_weights,
-            str(self.app.SOURCE_DIR / "model" / "deim-s-1024x1024.onnx"),
+            str(self.app.SOURCE_DIR / "model" / "deim-s-1024x1024-261124.onnx"),
         )
         self.assertIsNotNone(args.rec_weights)
 

@@ -13,11 +13,26 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
+[project.optional-dependencies]
+gpu-webgpu = [
+    "onnxruntime-ep-webgpu==0.6.0; python_version >= '3.11' and sys_platform != 'darwin'",
+]
+gpu-openvino = [
+    "onnxruntime-ep-openvino==1.8.1; python_version >= '3.11' and sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
+]
+gpu-all = [
+    "onnxruntime-ep-webgpu==0.6.0; python_version >= '3.11' and sys_platform != 'darwin'",
+    "onnxruntime-ep-openvino==1.8.1; python_version >= '3.11' and sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
+]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 ndlocr-lite = "cli:main"
 
 [tool.setuptools]
-py-modules = ["cli", "model_download", "ocr", "deim", "parseq", "ndl_parser", "tcy_wrapper", "pdf_output_utils", "version", "character_inclusion", "html_output", "tablecenternet"]
+py-modules = ["cli", "model_download", "ocr", "deim", "parseq", "ndl_parser", "tcy_wrapper", "pdf_output_utils", "version", "character_inclusion", "html_output", "tablecenternet", "ort_provider", "onnx_batch_patcher"]
 
 [tool.setuptools.package-dir]
 "" = "src"

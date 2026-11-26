@@ -41,6 +41,12 @@ from uicomponent.localelabel import TRANSLATIONS
 from uicomponent.textdaisy import TextDaisyExporter
 from collections import Counter
 from optional_features import load_optional_features
+from ort_provider import (
+    DEVICE_CHOICES,
+    detect_available_backends,
+    normalize_device_name,
+    should_parallelize_model_init,
+)
 from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
 from character_inclusion import apply_character_inclusion
 from html_output import build_html_document
@@ -272,62 +278,18 @@ class RecogLine:
 
 
 def process_cascade(alllineobj: RecogLine, recognizer30, recognizer50, recognizer100, is_cascade=True):
-    targetdflist30, targetdflist50, targetdflist100 = [], [], []
-    for lineobj in alllineobj:
-        if lineobj.pred_char_cnt == 3 and is_cascade:
-            targetdflist30.append(lineobj)
-        elif lineobj.pred_char_cnt == 2 and is_cascade:
-            targetdflist50.append(lineobj)
-        else:
-            targetdflist100.append(lineobj)
-    targetdflistall = []
-    with ThreadPoolExecutor(thread_name_prefix='recognizer') as executor:
-        jobs30 = [(lineobj, executor.submit(recognizer30.read, lineobj.npimg)) for lineobj in targetdflist30]
-        jobs50 = [(lineobj, executor.submit(recognizer50.read, lineobj.npimg)) for lineobj in targetdflist50]
-        jobs100 = [(lineobj, executor.submit(recognizer100.read, lineobj.npimg)) for lineobj in targetdflist100]
-
-        for lineobj, future in jobs30:
-            pred_str = future.result()
-            if len(pred_str) >= 25:
-                jobs50.append((lineobj, executor.submit(recognizer50.read, lineobj.npimg)))
-            else:
-                lineobj.pred_str = pred_str
-                targetdflistall.append(lineobj)
-
-        for lineobj, future in jobs50:
-            pred_str = future.result()
-            if len(pred_str) >= 45:
-                jobs100.append((lineobj, executor.submit(recognizer100.read, lineobj.npimg)))
-            else:
-                lineobj.pred_str = pred_str
-                targetdflistall.append(lineobj)
-
-        targetdflist200 = []
-        for lineobj, future in jobs100:
-            pred_str = future.result()
-            lineobj.pred_str = pred_str
-            if len(pred_str) >= 98 and lineobj.npimg.shape[0] < lineobj.npimg.shape[1]:
-                baseimg = lineobj.npimg
-                tmplineobj_1 = RecogLine(npimg=baseimg[:, :baseimg.shape[1] // 2, :], idx=lineobj.idx, pred_char_cnt=100)
-                tmplineobj_2 = RecogLine(npimg=baseimg[:, baseimg.shape[1] // 2:, :], idx=lineobj.idx, pred_char_cnt=100)
-                targetdflist200.append(tmplineobj_1)
-                targetdflist200.append(tmplineobj_2)
-            else:
-                targetdflistall.append(lineobj)
-
-        jobs200 = [(lineobj, executor.submit(recognizer100.read, lineobj.npimg)) for lineobj in targetdflist200]
-        resultlines200 = [future.result() for _, future in jobs200]
-        for i in range(0, len(targetdflist200) - 1, 2):
-            ia = targetdflist200[i]
-            lineobj = RecogLine(npimg=None, idx=ia.idx, pred_char_cnt=100, pred_str=resultlines200[i] + resultlines200[i + 1])
-            targetdflistall.append(lineobj)
-
-    targetdflistall = sorted(targetdflistall)
-    return [t.pred_str for t in targetdflistall]
+    load_runtime_modules()
+    return ocr.process_cascade(
+        alllineobj,
+        recognizer30,
+        recognizer50,
+        recognizer100,
+        is_cascade=is_cascade,
+    )
 
 
 def load_ocr_models(args, download_models=False):
-    """Create the four independent ONNX sessions concurrently."""
+    """Create the four OCR ONNX sessions (sequentially on GPU, concurrently on CPU)."""
     if download_models:
         from model_download import resolve_model_paths
 
@@ -335,17 +297,26 @@ def load_ocr_models(args, download_models=False):
     load_runtime_modules()
     if hasattr(ocr, '_load_charlist'):
         ocr._load_charlist(os.path.abspath(args.rec_classes))
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix='model-init') as executor:
-        detector_future = executor.submit(ocr.get_detector, args)
-        recognizer100_future = executor.submit(ocr.get_recognizer, args)
-        recognizer30_future = executor.submit(ocr.get_recognizer, args, args.rec_weights30)
-        recognizer50_future = executor.submit(ocr.get_recognizer, args, args.rec_weights50)
-        return (
-            detector_future.result(),
-            recognizer100_future.result(),
-            recognizer30_future.result(),
-            recognizer50_future.result(),
-        )
+
+    effective_device = getattr(args, 'device', None) or 'auto'
+    if should_parallelize_model_init(effective_device):
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='model-init') as executor:
+            detector_future = executor.submit(ocr.get_detector, args)
+            recognizer100_future = executor.submit(ocr.get_recognizer, args)
+            recognizer30_future = executor.submit(ocr.get_recognizer, args, args.rec_weights30)
+            recognizer50_future = executor.submit(ocr.get_recognizer, args, args.rec_weights50)
+            return (
+                detector_future.result(),
+                recognizer100_future.result(),
+                recognizer30_future.result(),
+                recognizer50_future.result(),
+            )
+
+    detector = ocr.get_detector(args)
+    recognizer100 = ocr.get_recognizer(args)
+    recognizer30 = ocr.get_recognizer(args, args.rec_weights30)
+    recognizer50 = ocr.get_recognizer(args, args.rec_weights50)
+    return detector, recognizer100, recognizer30, recognizer50
 
 
 def load_table_recognizer(args, download_models=False):
@@ -1059,7 +1030,17 @@ def parse_gui_args(argv=None, download_models=False):
     parser.add_argument('--rec-weights50', type=str, required=False, help='Path to parseq-tiny onnx file', default=str(SOURCE_DIR / 'model' / 'parseq-ndl-24x384-50-tiny-278epoch-261124.onnx'))
     parser.add_argument('--rec-weights', type=str, required=False, help='Path to parseq-tiny onnx file', default=str(SOURCE_DIR / 'model' / 'parseq-ndl-24x768-100-tiny-153epoch-261124.onnx'))
     parser.add_argument('--rec-classes', type=str, required=False, help='Path to list of class in yaml file', default=str(SOURCE_DIR / 'config' / 'NDLmoji.yaml'))
-    parser.add_argument('--device', type=str, required=False, help='Device use (cpu or cuda)', choices=['cpu', 'cuda'], default='cpu')
+    parser.add_argument(
+        '--device',
+        type=str,
+        required=False,
+        help='Execution device (auto, cpu, cuda, migraphx, rocm, openvino, webgpu, dml)',
+        choices=list(DEVICE_CHOICES),
+        default=None,
+    )
+    parser.add_argument('--device-id', type=int, required=False, default=None, help='GPU device/adapter index')
+    parser.add_argument('--batch-size', type=int, required=False, default=None, help='PARSeq batch size (0 for automatic)')
+    parser.add_argument('--strict-device', action='store_true', default=False, help='Fail instead of falling back to CPU')
     if TABLE_STRUCTURE_FEATURE is not None:
         TABLE_STRUCTURE_FEATURE.add_arguments(parser, SOURCE_DIR)
     if download_models:
@@ -1074,9 +1055,48 @@ def parse_gui_args(argv=None, download_models=False):
     return args
 
 
+def resolve_gui_engine_args(args, config_obj, cli_overrides=None):
+    """Apply saved config defaults to engine args unless explicitly overridden via CLI."""
+    overrides = cli_overrides if cli_overrides is not None else {}
+    device = overrides.get('device') if 'device' in overrides else config_obj.get('device', 'auto')
+    device_id = overrides.get('device_id') if 'device_id' in overrides else config_obj.get('device_id', 0)
+    batch_size = overrides.get('batch_size') if 'batch_size' in overrides else config_obj.get('batch_size', 0)
+
+    args.device = normalize_device_name(device)
+    try:
+        args.device_id = max(0, int(device_id))
+    except (TypeError, ValueError):
+        args.device_id = 0
+    try:
+        args.batch_size = max(0, int(batch_size))
+    except (TypeError, ValueError):
+        args.batch_size = 0
+    return args
+
+
+def format_gui_engine_status(detector, recognizer, langcode='ja'):
+    """Format active backend & batch size badge for the GUI status header."""
+    prefix = TRANSLATIONS['engine_status_prefix'][langcode]
+    profile = getattr(recognizer, 'backend_profile', None) or getattr(detector, 'backend_profile', None)
+    if profile is None:
+        return TRANSLATIONS['engine_status_loading'][langcode]
+    bs = getattr(recognizer, 'batch_size', 1)
+    bs_text = f', batch={bs}' if isinstance(bs, int) and bs > 1 else ''
+    fb_text = ' [fallback]' if getattr(profile, 'fallback_occurred', False) else ''
+    return f'{prefix}: {profile.display_name}{bs_text}{fb_text}'
+
+
 def main(page: ft.Page, args=None, download_models=False):
     if args is None:
         args = parse_gui_args(download_models=download_models)
+    cli_overrides = {}
+    if getattr(args, 'device', None) is not None:
+        cli_overrides['device'] = args.device
+    if getattr(args, 'device_id', None) is not None:
+        cli_overrides['device_id'] = args.device_id
+    if getattr(args, 'batch_size', None) is not None:
+        cli_overrides['batch_size'] = args.batch_size
+
     page.title = 'NDLOCR-Lite-GUI v{}'.format(__version__)
     page.theme_mode = ft.ThemeMode.SYSTEM
     page.window.icon = str(ASSETS_DIR / 'icon.png')
@@ -1096,6 +1116,7 @@ def main(page: ft.Page, args=None, download_models=False):
             load_obj = {}
 
     config_obj = default_config | load_obj
+    resolve_gui_engine_args(args, config_obj, cli_overrides)
 
     page.locale_configuration = ft.LocaleConfiguration(
         supported_locales=[
@@ -1326,107 +1347,122 @@ def main(page: ft.Page, args=None, download_models=False):
                     page_count,
                     config_obj.get('pdf_page_output', True),
                 )
-                for page_index in range(page_count):
-                    if ocr_cancel_event.is_set():
-                        return page_index, False, tei_jsonobjlist
-                    page_name = f'{output_stem}_{page_index + 1:05}.png'
-                    set_progress_message(f'{pdf_path_obj.name} page {page_index + 1}/{page_count}')
-                    progressmessage.update()
-
-                    img = await asyncio.to_thread(
-                        render_pdf_page_array,
-                        str(pdf_path_obj),
-                        page_index,
-                        render_scale,
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix='gui-pdf-prefetch') as prefetch_pool:
+                    next_page_future = (
+                        prefetch_pool.submit(
+                            render_pdf_page_array,
+                            str(pdf_path_obj),
+                            0,
+                            render_scale,
+                        )
+                        if page_count > 0
+                        else None
                     )
+                    for page_index in range(page_count):
+                        if ocr_cancel_event.is_set():
+                            return page_index, False, tei_jsonobjlist
+                        page_name = f'{output_stem}_{page_index + 1:05}.png'
+                        set_progress_message(f'{pdf_path_obj.name} page {page_index + 1}/{page_count}')
+                        progressmessage.update()
 
-                    page_result = await asyncio.to_thread(
-                        ocr._run_ocr_on_image_array,
-                        detector=origin_detector,
-                        recognizer30=origin_recognizer30,
-                        recognizer50=origin_recognizer50,
-                        recognizer100=origin_recognizer,
-                        inputname=page_name,
-                        img=img,
-                        outputpath=outputpath,
-                        save_viz=False,
-                        text_transform=get_character_inclusion_transform(config_obj),
-                    )
+                        img = await asyncio.wrap_future(next_page_future)
+                        if page_index + 1 < page_count and not ocr_cancel_event.is_set():
+                            next_page_future = prefetch_pool.submit(
+                                render_pdf_page_array,
+                                str(pdf_path_obj),
+                                page_index + 1,
+                                render_scale,
+                            )
+                        else:
+                            next_page_future = None
 
-                    page_tables = []
-                    if (
-                        TABLE_STRUCTURE_FEATURE is not None
-                        and chkbx_table_structure is not None
-                        and chkbx_table_structure.value
-                        and origin_table_recognizer is not None
-                    ):
-                        page_result, page_tables = await asyncio.to_thread(
-                            TABLE_STRUCTURE_FEATURE.infer,
-                            img,
+                        page_result = await asyncio.to_thread(
+                            ocr._run_ocr_on_image_array,
+                            detector=origin_detector,
+                            recognizer30=origin_recognizer30,
+                            recognizer50=origin_recognizer50,
+                            recognizer100=origin_recognizer,
+                            inputname=page_name,
+                            img=img,
+                            outputpath=outputpath,
+                            save_viz=False,
+                            text_transform=get_character_inclusion_transform(config_obj),
+                        )
+
+                        page_tables = []
+                        if (
+                            TABLE_STRUCTURE_FEATURE is not None
+                            and chkbx_table_structure is not None
+                            and chkbx_table_structure.value
+                            and origin_table_recognizer is not None
+                        ):
+                            page_result, page_tables = await asyncio.to_thread(
+                                TABLE_STRUCTURE_FEATURE.infer,
+                                img,
+                                page_result,
+                                origin_table_recognizer,
+                                args.table_crop_padding,
+                            )
+                            for table_item in page_tables:
+                                table_item['page_index'] = page_index
+                            TABLE_STRUCTURE_FEATURE.write_html_files(
+                                pdf_path_obj.name, page_tables, outputpath, output_stem,
+                            )
+
+                        page_results.append(page_result)
+                        all_json_contents.append(page_result['json_lines'])
+                        page_infos.append({
+                            'page_index': page_index,
+                            'img_width': page_result['img_width'],
+                            'img_height': page_result['img_height'],
+                            'img_name': page_result['img_name'],
+                        })
+                        all_text_pages.append(page_result['text'])
+                        page_markdown = build_gui_result_markdown(page_result, page_tables)
+                        output_markdown = build_output_result_markdown(page_result, page_tables)
+                        all_markdown_pages.append(output_markdown)
+                        html_pages.append((page_result, page_tables))
+                        if chkbx_html.value and separate_page_outputs:
+                            Path(outputpath, f'{output_stem}_{page_index + 1:05}.html').write_text(
+                                build_output_result_html(page_name, [(page_result, page_tables)]),
+                                encoding='utf-8',
+                            )
+                        outputplaintextlist.append(page_result['text'])
+                        outputtxtlist.append(page_markdown)
+                        all_page_xml.append(page_result['page_xml'])
+
+                        page_json_obj = write_pdf_page_outputs(
+                            outputpath,
+                            output_stem,
+                            page_index,
                             page_result,
-                            origin_table_recognizer,
-                            args.table_crop_padding,
+                            source_path=str(pdf_path_obj),
+                            write_json=separate_page_outputs and chkbx_json.value,
+                            write_xml=separate_page_outputs and chkbx_xml.value,
+                            write_txt=separate_page_outputs and chkbx_txt.value,
+                            write_tei=separate_page_outputs and chkbx_tei.value,
+                            convert_tei_func=convert_tei if chkbx_tei.value else None,
+                            include_xml_in_json=True,
+                            source_dpi=render_dpi,
                         )
-                        for table_item in page_tables:
-                            table_item['page_index'] = page_index
-                        TABLE_STRUCTURE_FEATURE.write_html_files(
-                            pdf_path_obj.name, page_tables, outputpath, output_stem,
-                        )
+                        alljsonobjlist.append(page_json_obj)
+                        if not separate_page_outputs:
+                            tei_jsonobjlist.append(page_json_obj)
 
-                    page_results.append(page_result)
-                    all_json_contents.append(page_result['json_lines'])
-                    page_infos.append({
-                        'page_index': page_index,
-                        'img_width': page_result['img_width'],
-                        'img_height': page_result['img_height'],
-                        'img_name': page_result['img_name'],
-                    })
-                    all_text_pages.append(page_result['text'])
-                    page_markdown = build_gui_result_markdown(page_result, page_tables)
-                    output_markdown = build_output_result_markdown(page_result, page_tables)
-                    all_markdown_pages.append(output_markdown)
-                    html_pages.append((page_result, page_tables))
-                    if chkbx_html.value and separate_page_outputs:
-                        Path(outputpath, f'{output_stem}_{page_index + 1:05}.html').write_text(
-                            build_output_result_html(page_name, [(page_result, page_tables)]),
-                            encoding='utf-8',
-                        )
-                    outputplaintextlist.append(page_result['text'])
-                    outputtxtlist.append(page_markdown)
-                    all_page_xml.append(page_result['page_xml'])
+                        if chkbx_visualize.value:
+                            viz_path = os.path.join(outputpath, f'viz_{page_name}')
+                            await asyncio.to_thread(
+                                origin_detector.drawxml_detections,
+                                npimg=img,
+                                xmlstr='<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>',
+                                categories=categories_org_name_index,
+                                outputimgpath=viz_path,
+                            )
+                            if os.path.exists(viz_path):
+                                visualizepathlist.append(viz_path)
 
-                    page_json_obj = write_pdf_page_outputs(
-                        outputpath,
-                        output_stem,
-                        page_index,
-                        page_result,
-                        source_path=str(pdf_path_obj),
-                        write_json=separate_page_outputs and chkbx_json.value,
-                        write_xml=separate_page_outputs and chkbx_xml.value,
-                        write_txt=separate_page_outputs and chkbx_txt.value,
-                        write_tei=separate_page_outputs and chkbx_tei.value,
-                        convert_tei_func=convert_tei if chkbx_tei.value else None,
-                        include_xml_in_json=True,
-                        source_dpi=render_dpi,
-                    )
-                    alljsonobjlist.append(page_json_obj)
-                    if not separate_page_outputs:
-                        tei_jsonobjlist.append(page_json_obj)
-
-                    if chkbx_visualize.value:
-                        viz_path = os.path.join(outputpath, f'viz_{page_name}')
-                        await asyncio.to_thread(
-                            origin_detector.drawxml_detections,
-                            npimg=img,
-                            xmlstr='<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>',
-                            categories=categories_org_name_index,
-                            outputimgpath=viz_path,
-                        )
-                        if os.path.exists(viz_path):
-                            visualizepathlist.append(viz_path)
-
-                    progressbar.value += 1 / max(allsum, 1)
-                    page.update()
+                        progressbar.value += 1 / max(allsum, 1)
+                        page.update()
             finally:
                 pdf_doc.close()
 
@@ -1544,135 +1580,148 @@ def main(page: ft.Page, args=None, download_models=False):
                         cancelled = True
                         break
 
-                for idx, inputpath in enumerate(standalone_inputpathlist):
-                    if ocr_cancel_event.is_set():
-                        cancelled=True
-                        break
-                    set_progress_message(inputpath)
-                    progressmessage.update()
-                    img = await asyncio.to_thread(load_rgb_image_array, inputpath)
-                    start = time.time()
-                    img_h, img_w = img.shape[:2]
-                    imgname = os.path.basename(inputpath)
-
-                    page_result = await asyncio.to_thread(
-                        ocr._run_ocr_on_image_array,
-                        detector=origin_detector,
-                        recognizer30=origin_recognizer30,
-                        recognizer50=origin_recognizer50,
-                        recognizer100=origin_recognizer,
-                        inputname=imgname,
-                        img=img,
-                        outputpath=outputpath,
-                        save_viz=False,
-                        text_transform=get_character_inclusion_transform(config_obj),
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix='gui-img-prefetch') as img_prefetch_pool:
+                    next_img_future = (
+                        img_prefetch_pool.submit(load_rgb_image_array, standalone_inputpathlist[0])
+                        if standalone_inputpathlist
+                        else None
                     )
+                    for idx, inputpath in enumerate(standalone_inputpathlist):
+                        if ocr_cancel_event.is_set():
+                            cancelled=True
+                            break
+                        set_progress_message(inputpath)
+                        progressmessage.update()
+                        img = await asyncio.wrap_future(next_img_future)
+                        if idx + 1 < len(standalone_inputpathlist) and not ocr_cancel_event.is_set():
+                            next_img_future = img_prefetch_pool.submit(
+                                load_rgb_image_array,
+                                standalone_inputpathlist[idx + 1],
+                            )
+                        else:
+                            next_img_future = None
+                        start = time.time()
+                        img_h, img_w = img.shape[:2]
+                        imgname = os.path.basename(inputpath)
 
-                    page_tables = []
-                    if (
-                        TABLE_STRUCTURE_FEATURE is not None
-                        and chkbx_table_structure is not None
-                        and chkbx_table_structure.value
-                        and origin_table_recognizer is not None
-                    ):
-                        page_result, page_tables = await asyncio.to_thread(
-                            TABLE_STRUCTURE_FEATURE.infer,
-                            img,
-                            page_result,
-                            origin_table_recognizer,
-                            args.table_crop_padding,
+                        page_result = await asyncio.to_thread(
+                            ocr._run_ocr_on_image_array,
+                            detector=origin_detector,
+                            recognizer30=origin_recognizer30,
+                            recognizer50=origin_recognizer50,
+                            recognizer100=origin_recognizer,
+                            inputname=imgname,
+                            img=img,
+                            outputpath=outputpath,
+                            save_viz=False,
+                            text_transform=get_character_inclusion_transform(config_obj),
                         )
 
-                    allxmlstr = '<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>'
-                    alltextlist = [page_result['text']]
-                    resjsonarray = page_result['json_lines']
-                    output_stem = os.path.splitext(os.path.basename(inputpath))[0]
-                    if page_tables:
-                        TABLE_STRUCTURE_FEATURE.write_html_files(
-                            imgname, page_tables, outputpath, output_stem,
-                        )
-                    page_markdown = build_gui_result_markdown(page_result, page_tables)
-                    outputplaintextlist.append(page_result['text'])
-                    outputtxtlist.append(page_markdown)
+                        page_tables = []
+                        if (
+                            TABLE_STRUCTURE_FEATURE is not None
+                            and chkbx_table_structure is not None
+                            and chkbx_table_structure.value
+                            and origin_table_recognizer is not None
+                        ):
+                            page_result, page_tables = await asyncio.to_thread(
+                                TABLE_STRUCTURE_FEATURE.infer,
+                                img,
+                                page_result,
+                                origin_table_recognizer,
+                                args.table_crop_padding,
+                            )
 
-                    alljsonobj = {
-                        'contents': [resjsonarray],
-                        'imginfo': {
-                            'img_width': img_w,
-                            'img_height': img_h,
-                            'img_path': inputpath,
-                            'img_name': os.path.basename(inputpath),
-                        },
-                        'xml': allxmlstr,
-                    }
-                    alljsonobjlist.append(alljsonobj)
-                    tei_jsonobjlist.append(alljsonobj)
+                        allxmlstr = '<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>'
+                        alltextlist = [page_result['text']]
+                        resjsonarray = page_result['json_lines']
+                        output_stem = os.path.splitext(os.path.basename(inputpath))[0]
+                        if page_tables:
+                            TABLE_STRUCTURE_FEATURE.write_html_files(
+                                imgname, page_tables, outputpath, output_stem,
+                            )
+                        page_markdown = build_gui_result_markdown(page_result, page_tables)
+                        outputplaintextlist.append(page_result['text'])
+                        outputtxtlist.append(page_markdown)
 
-                    if chkbx_xml.value:
-                        with open(os.path.join(outputpath, output_stem + '.xml'), 'w', encoding='utf-8') as wf:
-                            wf.write(allxmlstr)
+                        alljsonobj = {
+                            'contents': [resjsonarray],
+                            'imginfo': {
+                                'img_width': img_w,
+                                'img_height': img_h,
+                                'img_path': inputpath,
+                                'img_name': os.path.basename(inputpath),
+                            },
+                            'xml': allxmlstr,
+                        }
+                        alljsonobjlist.append(alljsonobj)
+                        tei_jsonobjlist.append(alljsonobj)
 
-                    if chkbx_visualize.value:
-                        output_vizpath = os.path.join(outputpath, 'viz_' + os.path.basename(inputpath))
-                        if output_vizpath.split('.')[-1] == 'jp2':
-                            output_vizpath = output_vizpath[:-4] + '.jpg'
-                        visualizepathlist.append(output_vizpath)
-                        await asyncio.to_thread(
-                            origin_detector.drawxml_detections,
-                            npimg=img,
-                            xmlstr=allxmlstr,
-                            categories=categories_org_name_index,
-                            outputimgpath=output_vizpath,
-                        )
+                        if chkbx_xml.value:
+                            with open(os.path.join(outputpath, output_stem + '.xml'), 'w', encoding='utf-8') as wf:
+                                wf.write(allxmlstr)
 
-                    if chkbx_json.value:
-                        with open(os.path.join(outputpath, output_stem + '.json'), 'w', encoding='utf-8') as wf:
-                            wf.write(json.dumps(alljsonobj, ensure_ascii=False, indent=2))
+                        if chkbx_visualize.value:
+                            output_vizpath = os.path.join(outputpath, 'viz_' + os.path.basename(inputpath))
+                            if output_vizpath.split('.')[-1] == 'jp2':
+                                output_vizpath = output_vizpath[:-4] + '.jpg'
+                            visualizepathlist.append(output_vizpath)
+                            await asyncio.to_thread(
+                                origin_detector.drawxml_detections,
+                                npimg=img,
+                                xmlstr=allxmlstr,
+                                categories=categories_org_name_index,
+                                outputimgpath=output_vizpath,
+                            )
 
-                    if chkbx_txt.value:
-                        with open(os.path.join(outputpath, output_stem + '.txt'), 'w', encoding='utf-8') as wtf:
-                            wtf.write('\n'.join(alltextlist))
+                        if chkbx_json.value:
+                            with open(os.path.join(outputpath, output_stem + '.json'), 'w', encoding='utf-8') as wf:
+                                wf.write(json.dumps(alljsonobj, ensure_ascii=False, indent=2))
 
-                    if chkbx_markdown.value:
-                        with open(os.path.join(outputpath, output_stem + '.md'), 'w', encoding='utf-8') as wf:
-                            wf.write(build_output_result_markdown(page_result, page_tables))
-                    if chkbx_html.value:
-                        Path(outputpath, output_stem + '.html').write_text(
-                            build_output_result_html(imgname, [(page_result, page_tables)]),
-                            encoding='utf-8',
-                        )
+                        if chkbx_txt.value:
+                            with open(os.path.join(outputpath, output_stem + '.txt'), 'w', encoding='utf-8') as wtf:
+                                wtf.write('\n'.join(alltextlist))
 
-                    if chkbx_pdf.value:
-                        pdf_outpath = os.path.join(outputpath, output_stem + '.pdf')
-                        await asyncio.to_thread(
-                            create_pdf_func,
-                            pdf_outpath,
-                            img,
-                            resjsonarray,
-                            chkbx_pdf_viztxt.value,
-                            resolution=int(pdf_resolution_textfield.value),
-                        )
-                        pdf_outpath_list.append(pdf_outpath)
+                        if chkbx_markdown.value:
+                            with open(os.path.join(outputpath, output_stem + '.md'), 'w', encoding='utf-8') as wf:
+                                wf.write(build_output_result_markdown(page_result, page_tables))
+                        if chkbx_html.value:
+                            Path(outputpath, output_stem + '.html').write_text(
+                                build_output_result_html(imgname, [(page_result, page_tables)]),
+                                encoding='utf-8',
+                            )
 
-                    print('Total calculation time (Detection + Recognition):', time.time() - start)
-                    completed_count+=1
-                    progressbar.value += 1 / max(allsum, 1)
-                    preview_prev_btn.disabled = False
-                    preview_next_btn.disabled = False
-                    if outputtxtlist:
-                        preview_plain_text.value = outputplaintextlist[preview_index] if preview_index < len(outputplaintextlist) else ''
-                        preview_text.value = outputtxtlist[preview_index]
-                    if len(visualizepathlist) > 0:
-                        preview_image.src = visualizepathlist[min(preview_index, len(visualizepathlist) - 1)]
-                    elif inputpathlist:
-                        preview_image.src = inputpathlist[min(preview_index, len(inputpathlist) - 1)]
-                    if inputpathlist:
-                        current_visualizeimgname.value = os.path.basename(inputpathlist[min(preview_index, len(inputpathlist) - 1)])
-                        preview_name_semantics.value = current_visualizeimgname.value
-                    preview_image.update()
-                    page.update()
-                    if cancelled:
-                        break
+                        if chkbx_pdf.value:
+                            pdf_outpath = os.path.join(outputpath, output_stem + '.pdf')
+                            await asyncio.to_thread(
+                                create_pdf_func,
+                                pdf_outpath,
+                                img,
+                                resjsonarray,
+                                chkbx_pdf_viztxt.value,
+                                resolution=int(pdf_resolution_textfield.value),
+                            )
+                            pdf_outpath_list.append(pdf_outpath)
+
+                        print('Total calculation time (Detection + Recognition):', time.time() - start)
+                        completed_count+=1
+                        progressbar.value += 1 / max(allsum, 1)
+                        preview_prev_btn.disabled = False
+                        preview_next_btn.disabled = False
+                        if outputtxtlist:
+                            preview_plain_text.value = outputplaintextlist[preview_index] if preview_index < len(outputplaintextlist) else ''
+                            preview_text.value = outputtxtlist[preview_index]
+                        if len(visualizepathlist) > 0:
+                            preview_image.src = visualizepathlist[min(preview_index, len(visualizepathlist) - 1)]
+                        elif inputpathlist:
+                            preview_image.src = inputpathlist[min(preview_index, len(inputpathlist) - 1)]
+                        if inputpathlist:
+                            current_visualizeimgname.value = os.path.basename(inputpathlist[min(preview_index, len(inputpathlist) - 1)])
+                            preview_name_semantics.value = current_visualizeimgname.value
+                        preview_image.update()
+                        page.update()
+                        if cancelled:
+                            break
                 if cancelled:
                     set_progress_message(
                         TRANSLATIONS["main_ocr_cancelled"][config_obj["langcode"]].format(
@@ -1954,6 +2003,26 @@ def main(page: ft.Page, args=None, download_models=False):
             page.update()
 
         def handle_customize_dlg_modal_close(e):
+            nonlocal origin_detector, origin_recognizer
+            nonlocal origin_recognizer30, origin_recognizer50
+            nonlocal origin_table_recognizer
+
+            new_device = normalize_device_name(dropdown_device.value or 'auto')
+            try:
+                new_batch_size = max(0, int(dropdown_batch_size.value or 0))
+            except (TypeError, ValueError):
+                new_batch_size = 0
+            try:
+                new_device_id = max(0, int(device_id_textfield.value or 0))
+            except (TypeError, ValueError):
+                new_device_id = 0
+
+            engine_changed = (
+                new_device != args.device
+                or new_batch_size != int(getattr(args, 'batch_size', 0))
+                or new_device_id != int(getattr(args, 'device_id', 0))
+            )
+
             updated_config = {
                 'json': chkbx_json.value,
                 'txt': chkbx_txt.value,
@@ -1968,6 +2037,9 @@ def main(page: ft.Page, args=None, download_models=False):
                 'pdf_resolution': int(pdf_resolution_textfield.value),
                 'text_daisy': chkbx_text_daisy.value,
                 'character_inclusion': chkbx_character_inclusion.value,
+                'device': new_device,
+                'batch_size': new_batch_size,
+                'device_id': new_device_id,
             }
             if chkbx_table_structure is not None:
                 updated_config['table_structure'] = chkbx_table_structure.value
@@ -1975,6 +2047,28 @@ def main(page: ft.Page, args=None, download_models=False):
             save_config()
             if customize_dlg_modal.open:
                 page.pop_dialog()
+
+            if engine_changed:
+                for key in ('device', 'batch_size', 'device_id'):
+                    cli_overrides.pop(key, None)
+                resolve_gui_engine_args(args, config_obj, cli_overrides)
+                if not model_state['loading'] and stop_ocr_btn.disabled:
+                    origin_detector = None
+                    origin_recognizer = None
+                    origin_recognizer30 = None
+                    origin_recognizer50 = None
+                    origin_table_recognizer = None
+                    model_state['loading'] = True
+                    set_model_loading_lock(True)
+                    parts_control(True)
+                    progressbar.value = None
+                    engine_status_text.value = TRANSLATIONS['engine_status_loading'][config_obj['langcode']]
+                    if config_obj['langcode'] == 'ja':
+                        set_progress_message('OCRモデルを再読み込み中…')
+                    else:
+                        set_progress_message('Reloading OCR models…')
+                    page.update()
+                    page.run_task(initialize_models)
 
         def change_pdfstatus(e):
             chkbx_pdf_viztxt.disabled = not chkbx_pdf.value
@@ -2106,6 +2200,72 @@ def main(page: ft.Page, args=None, download_models=False):
             TABLE_STRUCTURE_FEATURE.create_output_control(config_obj)
             if TABLE_STRUCTURE_FEATURE is not None
             else None
+        )
+        backend_availability = detect_available_backends()
+        is_ja = config_obj['langcode'] == 'ja'
+        device_labels = {
+            'auto': '自動（GPU優先）' if is_ja else 'Auto (Prefer GPU)',
+            'cuda': 'CUDA (NVIDIA)',
+            'openvino': 'OpenVINO (Intel Arc / iGPU)',
+            'webgpu': 'WebGPU (Radeon / Arc / NVIDIA)',
+            'migraphx': 'MIGraphX (Linux Radeon)',
+            'rocm': 'ROCm (Linux Radeon)',
+            'dml': 'DirectML (Windows)',
+            'cpu': 'CPU',
+        }
+        device_options = []
+        for dev_key in DEVICE_CHOICES:
+            label = device_labels.get(dev_key, dev_key)
+            if dev_key not in ('auto', 'cpu'):
+                ready = bool(backend_availability.get(dev_key, {}).get('available'))
+                suffix = '利用可能' if (ready and is_ja) else ('ready' if ready else ('未検出' if is_ja else 'unavailable'))
+                label = f'{label} [{suffix}]'
+            device_options.append(ft.dropdown.Option(key=dev_key, text=label))
+
+        current_device_val = normalize_device_name(args.device)
+        if current_device_val not in DEVICE_CHOICES:
+            current_device_val = 'auto'
+        dropdown_device = ft.Dropdown(
+            label=TRANSLATIONS['customize_device_label'][config_obj['langcode']],
+            value=current_device_val,
+            options=device_options,
+            width=360,
+            dense=True,
+            key='settings_device',
+        )
+        batch_options = [
+            ft.dropdown.Option(key='0', text='自動（推奨）' if is_ja else 'Auto (Recommended)'),
+            ft.dropdown.Option(key='1', text='1'),
+            ft.dropdown.Option(key='8', text='8'),
+            ft.dropdown.Option(key='16', text='16'),
+            ft.dropdown.Option(key='32', text='32'),
+            ft.dropdown.Option(key='64', text='64'),
+        ]
+        current_batch_val = str(int(getattr(args, 'batch_size', 0)))
+        if current_batch_val not in {'0', '1', '8', '16', '32', '64'}:
+            batch_options.append(ft.dropdown.Option(key=current_batch_val, text=current_batch_val))
+        dropdown_batch_size = ft.Dropdown(
+            label=TRANSLATIONS['customize_batch_size_label'][config_obj['langcode']],
+            value=current_batch_val,
+            options=batch_options,
+            width=210,
+            dense=True,
+            key='settings_batch_size',
+        )
+        device_id_textfield = ft.TextField(
+            label=TRANSLATIONS['customize_device_id_label'][config_obj['langcode']],
+            value=str(int(getattr(args, 'device_id', 0))),
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=110,
+            dense=True,
+            key='settings_device_id',
+        )
+        engine_status_text = ft.Text(
+            format_gui_engine_status(origin_detector, origin_recognizer, config_obj['langcode']),
+            size=12,
+            color=ft.Colors.ON_SURFACE_VARIANT,
+            selectable=True,
+            key='engine_status_text',
         )
         for settings_checkbox in (
             chkbx_json,
@@ -2249,6 +2409,23 @@ def main(page: ft.Page, args=None, download_models=False):
             ],
             'settings_additional_section',
         )
+        execution_engine_section = build_settings_section(
+            TRANSLATIONS['customize_execution_title'][config_obj['langcode']],
+            TRANSLATIONS['customize_execution_explain'][config_obj['langcode']],
+            ft.Icons.MEMORY_OUTLINED,
+            [
+                ft.Row(
+                    controls=[
+                        dropdown_device,
+                        dropdown_batch_size,
+                        device_id_textfield,
+                    ],
+                    spacing=8,
+                    wrap=True,
+                ),
+            ],
+            'settings_execution_engine_section',
+        )
         customize_dlg_modal = ft.AlertDialog(
             modal=True,
             title=ft.Row(
@@ -2264,6 +2441,7 @@ def main(page: ft.Page, args=None, download_models=False):
                         TRANSLATIONS['customize_dlg_modal_explain'][config_obj['langcode']],
                         color=ft.Colors.ON_SURFACE_VARIANT,
                     ),
+                    execution_engine_section,
                     output_formats_section,
                     ft.ResponsiveRow(
                         controls=[
@@ -2276,7 +2454,7 @@ def main(page: ft.Page, args=None, download_models=False):
                     ),
                 ],
                 width=860,
-                height=360,
+                height=430,
                 spacing=8,
                 scroll=ft.ScrollMode.AUTO,
             ),
@@ -2481,8 +2659,9 @@ def main(page: ft.Page, args=None, download_models=False):
             TRANSLATIONS['a11y_main_settings_group'][config_obj['langcode']],
             ft.Row([
                 localebutton,
+                engine_status_text,
                 *datapool_header_controls,
-            ]),
+            ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             'a11y_app_settings_section',
         )
         quick_actions_section = build_main_semantics_section(
@@ -2676,6 +2855,9 @@ def main(page: ft.Page, args=None, download_models=False):
                     tool.table_recognizer = origin_table_recognizer
 
                 progressbar.value = 0
+                engine_status_text.value = format_gui_engine_status(
+                    origin_detector, origin_recognizer, config_obj['langcode']
+                )
                 if config_obj['langcode'] == 'ja':
                     if TABLE_STRUCTURE_FEATURE is None:
                         set_progress_message(f'OCRモデル準備完了 ({model_state["elapsed"]:.1f}秒)')
@@ -2693,6 +2875,9 @@ def main(page: ft.Page, args=None, download_models=False):
             except Exception as ex:
                 model_state['error'] = ex
                 progressbar.value = 0
+                engine_status_text.value = format_gui_engine_status(
+                    origin_detector, origin_recognizer, config_obj['langcode']
+                )
                 set_progress_message(f'OCR model initialization failed: {ex}')
             finally:
                 model_state['loading'] = False
@@ -2705,6 +2890,9 @@ def main(page: ft.Page, args=None, download_models=False):
         if models_are_ready():
             set_model_loading_lock(False)
             parts_control(False)
+            engine_status_text.value = format_gui_engine_status(
+                origin_detector, origin_recognizer, config_obj['langcode']
+            )
             if model_state['elapsed'] is not None:
                 if config_obj['langcode'] == 'ja':
                     if TABLE_STRUCTURE_FEATURE is None:

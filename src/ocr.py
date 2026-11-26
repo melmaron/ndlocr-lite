@@ -10,6 +10,8 @@ from parseq import PARSEQ
 
 from yaml import safe_load
 from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 import time
 import shutil
 import json
@@ -18,6 +20,7 @@ from functools import lru_cache
 from reading_order.xy_cut.eval import eval_xml
 from reading_order.xy_cut.block_xy_cut import solve as solve_reading_order
 from ndl_parser import convert_to_xml_string3
+from ort_provider import DEVICE_CHOICES, format_device_diagnostics
 from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
 from version import __version__
 
@@ -655,7 +658,115 @@ class RecogLine:
     def __lt__(self, other):
         return self.idx < other.idx
 
+def _supports_batch_rec(recognizer) -> bool:
+    bs = getattr(recognizer, "batch_size", 1)
+    return (
+        callable(getattr(recognizer, "read_batch", None))
+        and isinstance(bs, (int, np.integer))
+        and not isinstance(bs, bool)
+        and int(bs) > 1
+    )
+
+
+def _is_concurrent_session_safe(recognizer) -> bool:
+    profile = getattr(recognizer, "backend_profile", None)
+    if profile is None:
+        return True
+    val = getattr(profile, "concurrent_session_run", True)
+    return bool(val) if isinstance(val, bool) else True
+
+
+def _process_cascade_batched(alllineobj, recognizer30, recognizer50, recognizer100, is_cascade=True):
+    targetdflist30, targetdflist50, targetdflist100 = [], [], []
+    for lineobj in alllineobj:
+        if lineobj.pred_char_cnt == 3 and is_cascade:
+            targetdflist30.append(lineobj)
+        elif lineobj.pred_char_cnt == 2 and is_cascade:
+            targetdflist50.append(lineobj)
+        else:
+            targetdflist100.append(lineobj)
+
+    targetdflistall = []
+
+    def _run_rec_batch(rec, items):
+        if not items:
+            return []
+        if callable(getattr(rec, "read_batch", None)):
+            return rec.read_batch([obj.npimg for obj in items])
+        return [rec.read(obj.npimg) for obj in items]
+
+    if targetdflist30:
+        preds30 = _run_rec_batch(recognizer30, targetdflist30)
+        for lineobj, pred_str in zip(targetdflist30, preds30):
+            if len(pred_str) >= 25:
+                targetdflist50.append(lineobj)
+            else:
+                lineobj.pred_str = pred_str
+                targetdflistall.append(lineobj)
+
+    if targetdflist50:
+        preds50 = _run_rec_batch(recognizer50, targetdflist50)
+        for lineobj, pred_str in zip(targetdflist50, preds50):
+            if len(pred_str) >= 45:
+                targetdflist100.append(lineobj)
+            else:
+                lineobj.pred_str = pred_str
+                targetdflistall.append(lineobj)
+
+    targetdflist200 = []
+    if targetdflist100:
+        preds100 = _run_rec_batch(recognizer100, targetdflist100)
+        for lineobj, pred_str in zip(targetdflist100, preds100):
+            lineobj.pred_str = pred_str
+            if len(pred_str) >= 98 and lineobj.npimg.shape[0] < lineobj.npimg.shape[1]:
+                baseimg = lineobj.npimg
+                targetdflist200.append(RecogLine(
+                    npimg=baseimg[:, :baseimg.shape[1] // 2, :],
+                    idx=lineobj.idx,
+                    pred_char_cnt=100,
+                ))
+                targetdflist200.append(RecogLine(
+                    npimg=baseimg[:, baseimg.shape[1] // 2:, :],
+                    idx=lineobj.idx,
+                    pred_char_cnt=100,
+                ))
+            else:
+                targetdflistall.append(lineobj)
+
+    if targetdflist200:
+        resultlines200 = _run_rec_batch(recognizer100, targetdflist200)
+        for i in range(0, len(targetdflist200) - 1, 2):
+            ia = targetdflist200[i]
+            targetdflistall.append(RecogLine(
+                npimg=None,
+                idx=ia.idx,
+                pred_char_cnt=100,
+                pred_str=resultlines200[i] + resultlines200[i + 1],
+            ))
+
+    targetdflistall = sorted(targetdflistall)
+    return [t.pred_str for t in targetdflistall]
+
+
 def process_cascade(alllineobj:RecogLine,recognizer30,recognizer50,recognizer100,is_cascade=True):
+    if (
+        _supports_batch_rec(recognizer30)
+        or _supports_batch_rec(recognizer50)
+        or _supports_batch_rec(recognizer100)
+        or not (
+            _is_concurrent_session_safe(recognizer30)
+            and _is_concurrent_session_safe(recognizer50)
+            and _is_concurrent_session_safe(recognizer100)
+        )
+    ):
+        return _process_cascade_batched(
+            alllineobj,
+            recognizer30,
+            recognizer50,
+            recognizer100,
+            is_cascade=is_cascade,
+        )
+
     targetdflist30,targetdflist50,targetdflist100=[],[],[]
     for lineobj in alllineobj:
         if lineobj.pred_char_cnt==3 and is_cascade:
@@ -733,7 +844,9 @@ def get_detector(args):
                       conf_threshold=args.det_conf_threshold,
                       iou_threshold=args.det_iou_threshold,
                       overlap_threshold=getattr(args, "det_overlap_threshold", 0.9),
-                      device=args.device)
+                      device=getattr(args, "device", "auto"),
+                      device_id=getattr(args, "device_id", 0),
+                      strict_device=getattr(args, "strict_device", False))
     return detector
 
 @lru_cache(maxsize=8)
@@ -752,7 +865,14 @@ def get_recognizer(args,weights_path=None):
 
     charlist=list(_load_charlist(os.path.abspath(classes_path)))
     
-    recognizer = PARSEQ(model_path=weights_path,charlist=charlist,device=args.device)
+    recognizer = PARSEQ(
+        model_path=weights_path,
+        charlist=charlist,
+        device=getattr(args, "device", "auto"),
+        device_id=getattr(args, "device_id", 0),
+        batch_size=getattr(args, "batch_size", 0),
+        strict_device=getattr(args, "strict_device", False),
+    )
     if getattr(args, 'enable_tcy', False):
         from tcy_wrapper import TateChuYokoWrapper
         tcy_kwargs = {k: v for k, v in vars(args).items() if k.startswith('tcy_') and k != 'enable_tcy' and v is not None}
@@ -776,18 +896,25 @@ def inference_on_detector(args,inputname:str,npimage:np.ndarray,outputpath:str,i
         pil_image.save(output_filepath)
     return detections,classeslist
 
-def process_detector(detector,inputname:str,npimage:np.ndarray,outputpath:str,issaveimg:bool=True):
-    detections = detector.detect(npimage)
+def _save_viz_image(detector, outputpath: str, inputname: str, npimage: np.ndarray, detections) -> None:
+    drawimage = npimage.copy()
+    pil_image = detector.draw_detections(drawimage, detections=detections)
+    os.makedirs(outputpath, exist_ok=True)
+    output_filepath = os.path.join(outputpath, f"viz_{Path(inputname).name}")
+    if output_filepath.split(".")[-1] == "jp2":
+        output_filepath = output_filepath[:-4] + ".jpg"
+    print(f"[INFO] Saving result on {output_filepath}")
+    pil_image.save(output_filepath)
+
+
+def process_detector(detector,inputname:str,npimage:np.ndarray,outputpath:str,issaveimg:bool=True,preprocessed=None):
+    if preprocessed is not None and hasattr(detector, "detect_from_preprocessed"):
+        detections = detector.detect_from_preprocessed(*preprocessed)
+    else:
+        detections = detector.detect(npimage)
     classeslist=list(detector.classes.values())
     if issaveimg:
-        drawimage = npimage.copy()
-        pil_image =detector.draw_detections(drawimage, detections=detections)
-        os.makedirs(outputpath,exist_ok=True)
-        output_filepath = os.path.join(outputpath,f"viz_{Path(inputname).name}")
-        if output_filepath.split(".")[-1]=="jp2":
-            output_filepath=output_filepath[:-4]+".jpg"
-        print(f"[INFO] Saving result on {output_filepath}")
-        pil_image.save(output_filepath)
+        _save_viz_image(detector, outputpath, inputname, npimage, detections)
     return detections,classeslist
 
 def _run_ocr_on_image_array(
@@ -800,6 +927,7 @@ def _run_ocr_on_image_array(
     outputpath: str,
     save_viz: bool = False,
     text_transform=None,
+    preprocessed_det=None,
 ):
     img_h, img_w = img.shape[:2]
     detections, classeslist = process_detector(
@@ -808,6 +936,7 @@ def _run_ocr_on_image_array(
         npimage=img,
         outputpath=outputpath,
         issaveimg=save_viz,
+        preprocessed=preprocessed_det,
     )
     resultobj = [dict(), dict()]
     resultobj[0][0] = list()
@@ -1296,6 +1425,87 @@ def embed_text_layer_pdf(
 
 
 
+_PREFETCH_DONE = object()
+_PREFETCH_ERROR = object()
+
+
+def _iter_prefetched(items, produce_fn, maxsize: int = 3):
+    """Yield produced items from a bounded background thread when len(items) > 1."""
+    items = list(items)
+    if len(items) <= 1:
+        for item in items:
+            yield item, produce_fn(item)
+        return
+
+    q = queue.Queue(maxsize=maxsize)
+    stop_event = threading.Event()
+
+    def _worker():
+        try:
+            for item in items:
+                if stop_event.is_set():
+                    break
+                payload = produce_fn(item)
+                while not stop_event.is_set():
+                    try:
+                        q.put((item, payload), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            if not stop_event.is_set():
+                q.put((_PREFETCH_DONE, None))
+        except BaseException as exc:
+            while not stop_event.is_set():
+                try:
+                    q.put((_PREFETCH_ERROR, exc), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    worker = threading.Thread(target=_worker, name="ocr-prefetch", daemon=True)
+    worker.start()
+    try:
+        while True:
+            tag, payload = q.get()
+            if tag is _PREFETCH_DONE:
+                break
+            if tag is _PREFETCH_ERROR:
+                raise payload
+            yield tag, payload
+    finally:
+        stop_event.set()
+        worker.join(timeout=2.0)
+
+
+def _preprocess_detector_input(detector, img: np.ndarray):
+    if hasattr(detector, "preprocess_with_meta"):
+        return detector.preprocess_with_meta(img)
+    return None
+
+
+def _write_image_outputs(
+    output_dir: str,
+    output_stem: str,
+    allxmlstr: str,
+    alljsonobj: dict,
+    alltextlist: list[str],
+    json_only: bool,
+    viz_args=None,
+) -> None:
+    if viz_args is not None:
+        detector, inputname, img, detections = viz_args
+        _save_viz_image(detector, output_dir, inputname, img, detections)
+    if not json_only:
+        with open(os.path.join(output_dir, output_stem + ".xml"), "w", encoding="utf-8") as wf:
+            wf.write(allxmlstr)
+    with open(os.path.join(output_dir, output_stem + ".json"), "w", encoding="utf-8") as wf:
+        alljsonstr = json.dumps(alljsonobj, ensure_ascii=False, indent=2)
+        wf.write(alljsonstr)
+    if not json_only:
+        with open(os.path.join(output_dir, output_stem + ".txt"), "w", encoding="utf-8") as wtf:
+            wtf.write("\n".join(alltextlist))
+
+
 def process_pdf_documents(args, pdf_paths: list[str]):
     try:
         import pypdfium2
@@ -1334,60 +1544,85 @@ def process_pdf_documents(args, pdf_paths: list[str]):
         start = time.time()
         pdf_path_obj = Path(pdf_path)
         output_stem = pdf_path_obj.stem
-        pdf_doc = pypdfium2.PdfDocument(str(pdf_path_obj))
+        pdf_doc_meta = pypdfium2.PdfDocument(str(pdf_path_obj))
+        try:
+            page_count = len(pdf_doc_meta)
+        finally:
+            pdf_doc_meta.close()
+
         page_results = []
         all_json_contents = []
         page_infos = []
         all_text_pages = []
         all_page_xml = []
         separate_page_outputs = should_output_pdf_pages_separately(
-            len(pdf_doc),
+            page_count,
             getattr(args, "pdf_page_output", True),
         )
 
-        for page_index in range(len(pdf_doc)):
-            page_name = f"{output_stem}_{page_index + 1:05}.png"
-            print(f"[INFO] OCR PDF page {page_index + 1}/{len(pdf_doc)}: {pdf_path_obj.name}")
-            rendered_pages = pdf_doc.render(
+        thread_local = threading.local()
+
+        def _render_pdf_page(page_index: int):
+            doc = getattr(thread_local, "pdf_doc", None)
+            if doc is None:
+                doc = pypdfium2.PdfDocument(str(pdf_path_obj))
+                thread_local.pdf_doc = doc
+            rendered_pages = doc.render(
                 pypdfium2.PdfBitmap.to_pil,
                 page_indices=[page_index],
                 scale=render_scale,
             )
             pil_image = next(iter(rendered_pages)).convert("RGB")
             img = np.array(pil_image)
-            page_result = _run_ocr_on_image_array(
-                detector=detector,
-                recognizer30=recognizer30,
-                recognizer50=recognizer50,
-                recognizer100=recognizer100,
-                inputname=page_name,
-                img=img,
-                outputpath=args.output,
-                save_viz=args.viz,
-            )
-            page_results.append(page_result)
-            all_json_contents.append(page_result["json_lines"])
-            page_infos.append({
-                "page_index": page_index,
-                "img_width": page_result["img_width"],
-                "img_height": page_result["img_height"],
-                "img_name": page_result["img_name"],
-            })
-            all_text_pages.append(page_result["text"])
-            all_page_xml.append(page_result["page_xml"])
-            write_pdf_page_outputs(
-                args.output,
-                output_stem,
-                page_index,
-                page_result,
-                source_path=str(pdf_path_obj),
-                write_json=separate_page_outputs,
-                write_xml=separate_page_outputs and not getattr(args, "json_only", False),
-                write_txt=separate_page_outputs and not getattr(args, "json_only", False),
-                source_dpi=render_dpi,
-            )
+            det_pre = _preprocess_detector_input(detector, img)
+            if page_index == page_count - 1:
+                doc.close()
+                thread_local.pdf_doc = None
+            return img, det_pre
 
-        pdf_doc.close()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-writer") as writer_pool:
+            write_futures = []
+            for page_index, (img, det_pre) in _iter_prefetched(range(page_count), _render_pdf_page, maxsize=3):
+                page_name = f"{output_stem}_{page_index + 1:05}.png"
+                print(f"[INFO] OCR PDF page {page_index + 1}/{page_count}: {pdf_path_obj.name}")
+                page_result = _run_ocr_on_image_array(
+                    detector=detector,
+                    recognizer30=recognizer30,
+                    recognizer50=recognizer50,
+                    recognizer100=recognizer100,
+                    inputname=page_name,
+                    img=img,
+                    outputpath=args.output,
+                    save_viz=args.viz,
+                    preprocessed_det=det_pre,
+                )
+                page_results.append(page_result)
+                all_json_contents.append(page_result["json_lines"])
+                page_infos.append({
+                    "page_index": page_index,
+                    "img_width": page_result["img_width"],
+                    "img_height": page_result["img_height"],
+                    "img_name": page_result["img_name"],
+                })
+                all_text_pages.append(page_result["text"])
+                all_page_xml.append(page_result["page_xml"])
+                if separate_page_outputs:
+                    write_futures.append(
+                        writer_pool.submit(
+                            write_pdf_page_outputs,
+                            args.output,
+                            output_stem,
+                            page_index,
+                            page_result,
+                            source_path=str(pdf_path_obj),
+                            write_json=True,
+                            write_xml=not getattr(args, "json_only", False),
+                            write_txt=not getattr(args, "json_only", False),
+                            source_dpi=render_dpi,
+                        )
+                    )
+            for fut in write_futures:
+                fut.result()
 
         if not getattr(args, "json_only", False) and not separate_page_outputs:
             with open(os.path.join(args.output, output_stem + ".xml"), "w", encoding="utf-8") as wf:
@@ -1461,119 +1696,119 @@ def process(args):
     recognizer50=get_recognizer(args=args,weights_path=args.rec_weights50)
     tatelinecnt=0
     alllinecnt=0
-    
-    for inputpath in inputpathlist:
-        ext=inputpath.split(".")[-1]
-        pil_image = Image.open(inputpath).convert('RGB')
-        img = np.array(pil_image)
-        start = time.time()
-        allxmlstr="<OCRDATASET>\n"
-        alltextlist=[]
-        resjsonarray=[]
-        imgname=os.path.basename(inputpath)
-        img_h,img_w=img.shape[:2]
-        detections,classeslist=process_detector(detector,inputname=imgname,npimage=img,outputpath=args.output,issaveimg=args.viz)
-        e1=time.time()
-        resultobj=[dict(),dict()]
-        resultobj[0][0]=list()
-        for i in range(17):
-            resultobj[1][i]=[]
-        for det in detections:
-            xmin,ymin,xmax,ymax=det["box"]
-            conf=det["confidence"]
-            char_count=det["pred_char_count"]
-            if det["class_index"]==0:
-                resultobj[0][0].append([xmin,ymin,xmax,ymax])
-            resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf,char_count])
-        xmlstr=convert_to_xml_string3(img_w, img_h, imgname, classeslist, resultobj)
-        xmlstr = xmlstr.replace("&", "&amp;")
-        xmlstr="<OCRDATASET>"+xmlstr+"</OCRDATASET>"
-        # print(xmlstr)
-        root = ET.fromstring(xmlstr)
-        eval_xml(root, logger=None)
-        alllineobj = []
-        alltextlist = []
 
-        for idx, lineobj in enumerate(root.findall(".//LINE")):
-            xmin = int(lineobj.get("X"))
-            ymin = int(lineobj.get("Y"))
-            line_w = int(lineobj.get("WIDTH"))
-            line_h = int(lineobj.get("HEIGHT"))
-            try:
-                pred_char_cnt = float(lineobj.get("PRED_CHAR_CNT"))
-            except:
-                pred_char_cnt = 100.0
-            
-            if line_h > line_w:
-                tatelinecnt += 1
-            alllinecnt += 1
-            # 部分画像の切り出し
-            lineimg = img[ymin:ymin+line_h, xmin:xmin+line_w, :]
-            linerecogobj = RecogLine(lineimg, idx, pred_char_cnt)
-            alllineobj.append(linerecogobj)
+    def _load_and_preprocess_image(inputpath: str):
+        with Image.open(inputpath) as pil_image:
+            img = np.array(pil_image.convert('RGB'))
+        det_pre = _preprocess_detector_input(detector, img)
+        return img, det_pre
 
-        if len(alllineobj) == 0 and len(detections) > 0:
-            # LINE 要素がないが検出がある場合は検出領域を LINE として扱う
-            page = root.find("PAGE")
-            for idx, det in enumerate(detections):
-                xmin, ymin, xmax, ymax = det["box"]
-                line_w = int(xmax - xmin)
-                line_h = int(ymax - ymin)
-                if line_w > 0 and line_h > 0:
-                    line_elem = ET.SubElement(page, "LINE")
-                    c_idx = int(det["class_index"])
-                    type_name = "本文"
-                    line_elem.set("TYPE", type_name)
-                    line_elem.set("X", str(int(xmin)))
-                    line_elem.set("Y", str(int(ymin)))
-                    line_elem.set("WIDTH", str(line_w))
-                    line_elem.set("HEIGHT", str(line_h))
-                    line_elem.set("CONF", f"{det['confidence']:0.3f}")
-                    pred_char_cnt = det.get("pred_char_count", 100.0)
-                    line_elem.set("PRED_CHAR_CNT", f"{pred_char_cnt:0.3f}")
-                    if line_h > line_w:
-                        tatelinecnt += 1
-                    alllinecnt += 1
-                    lineimg = img[int(ymin):int(ymax), int(xmin):int(xmax), :]
-                    linerecogobj = RecogLine(lineimg, idx, pred_char_cnt)
-                    alllineobj.append(linerecogobj)
+    json_only = getattr(args, "json_only", False)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-writer") as writer_pool:
+        write_futures = []
+        for inputpath, (img, det_pre) in _iter_prefetched(inputpathlist, _load_and_preprocess_image, maxsize=3):
+            start = time.time()
+            allxmlstr="<OCRDATASET>\n"
+            alltextlist=[]
+            resjsonarray=[]
+            imgname=os.path.basename(inputpath)
+            img_h,img_w=img.shape[:2]
+            detections,classeslist=process_detector(
+                detector,
+                inputname=imgname,
+                npimage=img,
+                outputpath=args.output,
+                issaveimg=False,
+                preprocessed=det_pre,
+            )
+            resultobj=[dict(),dict()]
+            resultobj[0][0]=list()
+            for i in range(17):
+                resultobj[1][i]=[]
+            for det in detections:
+                xmin,ymin,xmax,ymax=det["box"]
+                conf=det["confidence"]
+                char_count=det["pred_char_count"]
+                if det["class_index"]==0:
+                    resultobj[0][0].append([xmin,ymin,xmax,ymax])
+                resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf,char_count])
+            xmlstr=convert_to_xml_string3(img_w, img_h, imgname, classeslist, resultobj)
+            xmlstr = xmlstr.replace("&", "&amp;")
+            xmlstr="<OCRDATASET>"+xmlstr+"</OCRDATASET>"
+            root = ET.fromstring(xmlstr)
+            eval_xml(root, logger=None)
+            alllineobj = []
+            alltextlist = []
 
-        # 認識プロセス
-        resultlinesall = process_cascade(
-            alllineobj, recognizer30, recognizer50, recognizer100, is_cascade=True
-        )
-        alltextlist.append("\n".join(resultlinesall))
-        
-        for idx,lineobj in enumerate(root.findall(".//LINE")):
-            lineobj.set("STRING",resultlinesall[idx])
-            xmin=int(lineobj.get("X"))
-            ymin=int(lineobj.get("Y"))
-            line_w=int(lineobj.get("WIDTH"))
-            line_h=int(lineobj.get("HEIGHT"))
-            try:
-                conf=float(lineobj.get("CONF"))
-            except:
-                conf=0.0
-            
-            # XML TYPE -> c_idx
-            type_str = lineobj.get("TYPE", "")
-            c_idx = classeslist.index(type_str) if type_str in classeslist else 1
+            for idx, lineobj in enumerate(root.findall(".//LINE")):
+                xmin = int(lineobj.get("X"))
+                ymin = int(lineobj.get("Y"))
+                line_w = int(lineobj.get("WIDTH"))
+                line_h = int(lineobj.get("HEIGHT"))
+                try:
+                    pred_char_cnt = float(lineobj.get("PRED_CHAR_CNT"))
+                except Exception:
+                    pred_char_cnt = 100.0
 
-            jsonobj={"boundingBox": [[xmin,ymin],[xmin,ymin+line_h],[xmin+line_w,ymin],[xmin+line_w,ymin+line_h]],
-                "id": idx,"isVertical": "true" if line_h > line_w else "false","text": resultlinesall[idx],"isTextline": "true","confidence": conf, "class_index": c_idx}
-            resjsonarray.append(jsonobj)
+                if line_h > line_w:
+                    tatelinecnt += 1
+                alllinecnt += 1
+                lineimg = img[ymin:ymin+line_h, xmin:xmin+line_w, :]
+                linerecogobj = RecogLine(lineimg, idx, pred_char_cnt)
+                alllineobj.append(linerecogobj)
 
-        allxmlstr+=(ET.tostring(root.find("PAGE"), encoding='unicode')+"\n")
-        allxmlstr+="</OCRDATASET>"
-        if alllinecnt>0 and tatelinecnt/alllinecnt>0.5:
-            alltextlist=alltextlist[::-1]
-        output_stem = os.path.splitext(os.path.basename(inputpath))[0]
-        
-        if not getattr(args, "json_only", False):
-            with open(os.path.join(args.output,output_stem+".xml"),"w",encoding="utf-8") as wf:
-                wf.write(allxmlstr)
-                
-        with open(os.path.join(args.output,output_stem+".json"),"w",encoding="utf-8") as wf:
+            if len(alllineobj) == 0 and len(detections) > 0:
+                page = root.find("PAGE")
+                for idx, det in enumerate(detections):
+                    xmin, ymin, xmax, ymax = det["box"]
+                    line_w = int(xmax - xmin)
+                    line_h = int(ymax - ymin)
+                    if line_w > 0 and line_h > 0:
+                        line_elem = ET.SubElement(page, "LINE")
+                        type_name = "本文"
+                        line_elem.set("TYPE", type_name)
+                        line_elem.set("X", str(int(xmin)))
+                        line_elem.set("Y", str(int(ymin)))
+                        line_elem.set("WIDTH", str(line_w))
+                        line_elem.set("HEIGHT", str(line_h))
+                        line_elem.set("CONF", f"{det['confidence']:0.3f}")
+                        pred_char_cnt = det.get("pred_char_count", 100.0)
+                        line_elem.set("PRED_CHAR_CNT", f"{pred_char_cnt:0.3f}")
+                        if line_h > line_w:
+                            tatelinecnt += 1
+                        alllinecnt += 1
+                        lineimg = img[int(ymin):int(ymax), int(xmin):int(xmax), :]
+                        linerecogobj = RecogLine(lineimg, idx, pred_char_cnt)
+                        alllineobj.append(linerecogobj)
+
+            resultlinesall = process_cascade(
+                alllineobj, recognizer30, recognizer50, recognizer100, is_cascade=True
+            )
+            alltextlist.append("\n".join(resultlinesall))
+
+            for idx,lineobj in enumerate(root.findall(".//LINE")):
+                lineobj.set("STRING",resultlinesall[idx])
+                xmin=int(lineobj.get("X"))
+                ymin=int(lineobj.get("Y"))
+                line_w=int(lineobj.get("WIDTH"))
+                line_h=int(lineobj.get("HEIGHT"))
+                try:
+                    conf=float(lineobj.get("CONF"))
+                except Exception:
+                    conf=0.0
+
+                type_str = lineobj.get("TYPE", "")
+                c_idx = classeslist.index(type_str) if type_str in classeslist else 1
+
+                jsonobj={"boundingBox": [[xmin,ymin],[xmin,ymin+line_h],[xmin+line_w,ymin],[xmin+line_w,ymin+line_h]],
+                    "id": idx,"isVertical": "true" if line_h > line_w else "false","text": resultlinesall[idx],"isTextline": "true","confidence": conf, "class_index": c_idx}
+                resjsonarray.append(jsonobj)
+
+            allxmlstr+=(ET.tostring(root.find("PAGE"), encoding='unicode')+"\n")
+            allxmlstr+="</OCRDATASET>"
+            if alllinecnt>0 and tatelinecnt/alllinecnt>0.5:
+                alltextlist=alltextlist[::-1]
+            output_stem = os.path.splitext(os.path.basename(inputpath))[0]
             alljsonobj={
                 "contents":[resjsonarray],
                 "imginfo": {
@@ -1583,13 +1818,23 @@ def process(args):
                     "img_name":os.path.basename(inputpath)
                 }
             }
-            alljsonstr=json.dumps(alljsonobj,ensure_ascii=False,indent=2)
-            wf.write(alljsonstr)
-            
-        if not getattr(args, "json_only", False):
-            with open(os.path.join(args.output,output_stem+".txt"),"w",encoding="utf-8") as wtf:
-                wtf.write("\n".join(alltextlist))
-        print("Total calculation time (Detection + Recognition):",time.time()-start)
+            viz_args = (detector, imgname, img, detections) if args.viz else None
+            write_futures.append(
+                writer_pool.submit(
+                    _write_image_outputs,
+                    args.output,
+                    output_stem,
+                    allxmlstr,
+                    alljsonobj,
+                    alltextlist,
+                    json_only,
+                    viz_args,
+                )
+            )
+            print("Total calculation time (Detection + Recognition):",time.time()-start)
+
+        for fut in write_futures:
+            fut.result()
 
 def main(download_models=False):
     import argparse
@@ -1609,7 +1854,7 @@ def main(download_models=False):
     parser.add_argument("--sourcedir", type=str, required=False, help="Path to image directory")
     parser.add_argument("--sourceimg", type=str, required=False, help="Path to image directory")
     parser.add_argument("--sourcepdf", type=str, required=False, help="Path to source PDF")
-    parser.add_argument("--output", type=str, required=True, help="Path to output directory")
+    parser.add_argument("--output", type=str, required=False, help="Path to output directory")
     parser.add_argument("--viz", type=bool, required=False, help="Save visualized image",default=False)
     parser.add_argument("--pdf-output", type=str, required=False, help="Path to output text-layer PDF")
     parser.add_argument("--pdf-render-dpi", "--pdf-dpi", dest="pdf_render_dpi", type=float, required=False, default=150.0, help="DPI used to render PDF pages for OCR")
@@ -1627,7 +1872,18 @@ def main(download_models=False):
     parser.add_argument("--rec-weights50", type=str, required=False, help="Path to parseq-tiny onnx file", default=str(base_dir / "model" / "parseq-ndl-24x384-50-tiny-278epoch-261124.onnx"))
     parser.add_argument("--rec-weights", type=str, required=False, help="Path to parseq-tiny onnx file", default=str(base_dir / "model" / "parseq-ndl-24x768-100-tiny-153epoch-261124.onnx"))
     parser.add_argument("--rec-classes", type=str, required=False, help="Path to list of class in yaml file", default=str(base_dir / "config" / "NDLmoji.yaml"))
-    parser.add_argument("--device", type=str, required=False, help="Device use (cpu or cuda)", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument(
+        "--device",
+        type=str,
+        required=False,
+        help="Execution device (auto, cpu, cuda, migraphx, rocm, openvino, webgpu, dml)",
+        choices=list(DEVICE_CHOICES),
+        default="auto",
+    )
+    parser.add_argument("--device-id", type=int, required=False, default=0, help="GPU device/adapter index")
+    parser.add_argument("--batch-size", type=int, required=False, default=0, help="PARSeq batch size (0 for automatic per backend)")
+    parser.add_argument("--strict-device", action="store_true", default=False, help="Fail instead of falling back to CPU if the requested GPU backend fails")
+    parser.add_argument("--check-device", action="store_true", default=False, help="Print available GPU execution providers and exit")
     parser.add_argument("--enable-tcy", action="store_true", dest="enable_tcy", default=False, help="Enable tate-chuu-yoko (縦中横) detection for vertical text (e.g. newspaper OCR)")
     parser.add_argument("--json-only", action="store_true", help="Disable .xml and .txt output and only output JSON")
     parser.add_argument("--version", action="version", version=f"%(prog)s {application_version}")
@@ -1636,14 +1892,24 @@ def main(download_models=False):
 
         parser.set_defaults(**{option: None for option in MODELS})
     args, remaining = parser.parse_known_args()
-    if args.enable_tcy and remaining:
-        from tcy_wrapper import add_tcy_arguments
-        tcy_parser = add_tcy_arguments(parser)
-        tcy_args = tcy_parser.parse_args(remaining)
-        for k, v in vars(tcy_args).items():
-            if v is not None:
-                setattr(args, k, v)
-    args = parser.parse_args()
+    if args.enable_tcy:
+        if remaining:
+            from tcy_wrapper import add_tcy_arguments
+            tcy_parser = add_tcy_arguments(parser)
+            tcy_args = tcy_parser.parse_args(remaining)
+            for k, v in vars(tcy_args).items():
+                if v is not None:
+                    setattr(args, k, v)
+    elif remaining:
+        parser.parse_args()
+
+    if args.check_device:
+        print(format_device_diagnostics())
+        return
+
+    if not args.output:
+        parser.error("the following arguments are required: --output")
+
     if download_models:
         try:
             resolve_model_paths(args, base_dir / "model")
