@@ -72,7 +72,43 @@ class ParallelOcrTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "boom at 3"):
             list(ocr._iter_prefetched(items, failing, maxsize=2))
 
-    def test_batched_cascade_matches_sequential_with_overflow_and_split(self):
+    def test_iter_prefetched_does_not_leak_worker_on_early_exit(self):
+        import threading
+        import time
+
+        def wait_for_prefetch_threads_gone(timeout=2.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if not any(t.name == "ocr-prefetch" for t in threading.enumerate()):
+                    return True
+                time.sleep(0.02)
+            return False
+
+        # Consumer raises while the producer is blocked on the queue: the
+        # background thread must still terminate (a plain blocking sentinel
+        # put() used to leave it stuck forever).
+        gen = ocr._iter_prefetched([1, 2], lambda x: x, maxsize=1)
+        self.assertEqual(next(gen), (1, 1))
+        time.sleep(0.3)
+        with self.assertRaisesRegex(RuntimeError, "consumer boom"):
+            gen.throw(RuntimeError("consumer boom"))
+        self.assertTrue(wait_for_prefetch_threads_gone())
+
+        # Abandoning the generator early (break) must not leak either.
+        gen2 = ocr._iter_prefetched([1, 2, 3], lambda x: x, maxsize=1)
+        self.assertEqual(next(gen2), (1, 1))
+        time.sleep(0.3)
+        gen2.close()
+        self.assertTrue(wait_for_prefetch_threads_gone())
+
+        # Normal consumption still yields every item in order and terminates.
+        self.assertEqual(
+            list(ocr._iter_prefetched([1, 2, 3], lambda x: x * 2, maxsize=1)),
+            [(1, 2), (2, 4), (3, 6)],
+        )
+        self.assertTrue(wait_for_prefetch_threads_gone())
+
+
         lines = [
             ocr.RecogLine(_make_img(10), idx=0, pred_char_cnt=3),
             ocr.RecogLine(_make_img(11), idx=1, pred_char_cnt=3),

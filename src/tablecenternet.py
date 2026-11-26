@@ -27,6 +27,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -713,6 +714,7 @@ class TableCenterNetRecognizer:
         self.use_nms = bool(use_nms)
         self.iou_thresh = float(iou_thresh)
         self._session: Optional[ort.InferenceSession] = None
+        self._session_lock = threading.Lock()
         self.backend_profile = None
         self._input_name: Optional[str] = None
         self._input_h: Optional[int] = None
@@ -729,24 +731,29 @@ class TableCenterNetRecognizer:
         return self
 
     def _ensure_session(self) -> None:
+        # Double-checked locking: publish ``_session`` last so concurrent lazy
+        # loaders never observe a half-initialised recognizer.
         if self._session is not None:
             return
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"TableCenterNet model is not found: {self.model_path}")
-        session, profile = make_session_with_profile(
-            self.model_path,
-            self.device,
-            device_id=self.device_id,
-            strict_device=self.strict_device,
-        )
-        input_name, input_h, input_w = fixed_input_hw(session)
-        in_type = str(session.get_inputs()[0].type)
-        self._session = session
-        self.backend_profile = profile
-        self._input_name = input_name
-        self._input_h = input_h
-        self._input_w = input_w
-        self._input_dtype = np.float16 if "float16" in in_type else np.float32
+        with self._session_lock:
+            if self._session is not None:
+                return
+            if not self.model_path.exists():
+                raise FileNotFoundError(f"TableCenterNet model is not found: {self.model_path}")
+            session, profile = make_session_with_profile(
+                self.model_path,
+                self.device,
+                device_id=self.device_id,
+                strict_device=self.strict_device,
+            )
+            input_name, input_h, input_w = fixed_input_hw(session)
+            in_type = str(session.get_inputs()[0].type)
+            self.backend_profile = profile
+            self._input_name = input_name
+            self._input_h = input_h
+            self._input_w = input_w
+            self._input_dtype = np.float16 if "float16" in in_type else np.float32
+            self._session = session
 
     def recognize_rgb(self, image_rgb: np.ndarray) -> List[Dict[str, object]]:
         """Infer table cells from an RGB crop and return crop-local coordinates."""
@@ -1868,12 +1875,16 @@ def infer_tables_from_page(
     Returns ``(page_result, tables)``. The ordinary OCR result is preserved
     unchanged, while each table item contains an additional standalone HTML.
     """
-    regions = extract_table_regions(str(page_result.get("page_xml", "")))
-    if not regions:
+    try:
+        page_xml = page_result.get("page_xml")
+        regions = extract_table_regions(str(page_xml) if page_xml is not None else "")
+        if not regions:
+            return dict(page_result), []
+        img_h, img_w = image_rgb.shape[:2]
+        original_lines = list(page_result.get("json_lines") or [])
+    except Exception as exc:
+        print(f"[WARN] TableCenterNet page preparation failed: {exc}")
         return dict(page_result), []
-
-    img_h, img_w = image_rgb.shape[:2]
-    original_lines = list(page_result.get("json_lines", []))
     tables: List[Dict[str, object]] = []
 
     for table_index, region in enumerate(regions, start=1):

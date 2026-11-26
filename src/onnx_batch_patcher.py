@@ -88,8 +88,51 @@ def is_dynamic_batch_model(model_path: str | Path) -> bool:
         return False
 
 
+def is_valid_dynamic_batch_cache(model_path: str | Path) -> bool:
+    """Return True if a cached dynamic-batch model can be parsed and is actually dynamic.
+
+    Cache files can be truncated by an interrupted copy, a full disk, or an
+    antivirus scanner. A corrupted cache must never be handed to ONNX Runtime
+    (it raises ``InvalidProtobuf``/``INVALID_GRAPH`` and aborts OCR), so the
+    caller drops and rebuilds it instead.
+    """
+    try:
+        path = Path(model_path)
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        try:
+            onnx, _, _ = _import_onnx()
+        except ImportError:
+            # Without the onnx package we cannot validate; let ONNX Runtime try.
+            return True
+        model = onnx.load(str(path), load_external_data=False)
+        if not model.graph.input:
+            return False
+        dims = model.graph.input[0].type.tensor_type.shape.dim
+        if not dims:
+            return False
+        dim0 = dims[0]
+        return bool(dim0.dim_param) or dim0.dim_value == 0
+    except Exception:
+        return False
+
+
+def _graph_has_subgraphs(graph) -> bool:
+    """Return True if any node carries a control-flow subgraph attribute."""
+    graph_attr_type = 5  # onnx.AttributeProto.GRAPH
+    for node in graph.node:
+        for attribute in node.attribute:
+            if attribute.type == graph_attr_type:
+                return True
+    return False
+
+
 def _prune_unused_constants(model) -> None:
     graph = model.graph
+    if _graph_has_subgraphs(graph):
+        # Outer-scope initializers may be referenced only from inside an
+        # If/Loop/Scan body; without a recursive liveness walk, keep them.
+        return
     used = {output.name for output in graph.output if output.name}
     for node in reversed(list(graph.node)):
         if node.op_type == "Constant" and node.output and node.output[0] not in used:
@@ -387,10 +430,12 @@ def verify_dynamic_batch_equivalence(
         raise ValueError("Argmax mismatch between original batch=1 and patched dynamic-batch model.")
 
     max_abs_diff = float(np.max(np.abs(orig_outputs - patched_outputs)))
-    if max_abs_diff > atol:
+    if not np.isfinite(max_abs_diff) or max_abs_diff > atol:
         raise ValueError(
             f"Max abs diff {max_abs_diff:.4e} exceeded threshold {atol:.4e}."
         )
+    if not np.isfinite(orig_outputs).all() or not np.isfinite(patched_outputs).all():
+        raise ValueError("Non-finite values in batch=1 or dynamic-batch outputs.")
     return max_abs_diff
 
 
@@ -405,12 +450,14 @@ def prepare_parseq_model(
     """Prepare and cache a dynamic-batch PARSeq ONNX model, falling back cleanly on failure."""
     src = Path(model_path)
     if precision not in SUPPORTED_PRECISIONS:
+        reason = f"Unsupported precision '{precision}'; falling back to batch=1"
+        print(f"[WARN] {reason}", file=sys.stderr)
         return PatchedModelResult(
             model_path=src,
             dynamic_batch=is_dynamic_batch_model(src),
             precision="fp32",
             from_cache=False,
-            fallback_reason=f"Unsupported precision '{precision}'",
+            fallback_reason=reason,
         )
 
     if is_dynamic_batch_model(src):
@@ -442,19 +489,39 @@ def prepare_parseq_model(
             fallback_reason=reason,
         )
 
-    src_hash = _file_sha256(src)
-    cached = build_cache_path(
-        src, src_hash, precision=precision, dynamic_batch=True, cache_dir=cache_dir
-    )
-    if cached.is_file():
+    try:
+        src_hash = _file_sha256(src)
+        cached = build_cache_path(
+            src, src_hash, precision=precision, dynamic_batch=True, cache_dir=cache_dir
+        )
+        if cached.is_file():
+            if is_valid_dynamic_batch_cache(cached):
+                return PatchedModelResult(
+                    model_path=cached,
+                    dynamic_batch=True,
+                    precision=precision,
+                    from_cache=True,
+                )
+            print(
+                f"[WARN] Corrupted dynamic-batch cache detected; rebuilding: {cached.name}",
+                file=sys.stderr,
+            )
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+        cached.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        reason = f"Dynamic batch cache unavailable for {src.name}: {exc}"
+        print(f"[WARN] {reason}", file=sys.stderr)
         return PatchedModelResult(
-            model_path=cached,
-            dynamic_batch=True,
+            model_path=src,
+            dynamic_batch=False,
             precision=precision,
-            from_cache=True,
+            from_cache=False,
+            fallback_reason=reason,
         )
 
-    cached.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -486,5 +553,8 @@ def prepare_parseq_model(
             fallback_reason=reason,
         )
     finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass

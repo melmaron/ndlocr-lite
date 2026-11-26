@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -89,6 +90,88 @@ class GuiGpuConfigTest(unittest.TestCase):
         )
         status_fb = self.app.format_gui_engine_status(det, rec_fb, "en")
         self.assertEqual(status_fb, "Engine: CPU [fallback]")
+
+    def test_resolve_gui_engine_args_sanitizes_unknown_device(self):
+        args = self.app.parse_gui_args([], download_models=True)
+        self.app.resolve_gui_engine_args(
+            args, {"device": "bogus-device", "device_id": -1, "batch_size": -3}, {}
+        )
+        self.assertEqual(args.device, "auto")
+        self.assertEqual(args.device_id, 0)
+        self.assertEqual(args.batch_size, 0)
+
+    def test_busy_tracker_nests_and_never_goes_negative(self):
+        tracker = self.app.BusyTracker()
+        self.assertFalse(tracker.active)
+        tracker.enter()
+        tracker.enter()
+        self.assertTrue(tracker.active)
+        tracker.leave()
+        self.assertTrue(tracker.active)
+        tracker.leave()
+        self.assertFalse(tracker.active)
+        tracker.leave()
+        self.assertFalse(tracker.active)
+
+    def test_parse_pdf_dpi_clamps_invalid_values(self):
+        for value, expected in [
+            ("300", 300.0),
+            (150, 150.0),
+            ("", 300.0),
+            (None, 300.0),
+            ("abc", 300.0),
+            ("0", 300.0),
+            ("-5", 300.0),
+            ("nan", 300.0),
+            ("0.1", 1.0),
+        ]:
+            with self.subTest(value=value):
+                self.assertEqual(self.app.parse_pdf_dpi(value), expected)
+
+    def test_load_user_config_is_defensive_and_normalizes_langcode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "userconf.yaml"
+            defaults = {"langcode": "ja", "device": "auto"}
+            cfg, warning = self.app.load_user_config(path, defaults)
+            self.assertIsNone(warning)
+            self.assertEqual(cfg, defaults)
+
+            path.write_text("a: [1, 2", encoding="utf-8")
+            cfg, warning = self.app.load_user_config(path, defaults)
+            self.assertIsNotNone(warning)
+            self.assertEqual(cfg["langcode"], "ja")
+
+            path.write_text("- just\n- a list\n", encoding="utf-8")
+            cfg, warning = self.app.load_user_config(path, defaults)
+            self.assertIsNotNone(warning)
+            self.assertEqual(cfg["langcode"], "ja")
+
+            path.write_text("langcode: fr\ndevice: cuda\n", encoding="utf-8")
+            cfg, warning = self.app.load_user_config(path, defaults)
+            self.assertIsNone(warning)
+            self.assertEqual(cfg["langcode"], "ja")  # unsupported locale falls back
+            self.assertEqual(cfg["device"], "cuda")
+
+    def test_save_user_config_is_atomic_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "nested" / "userconf.yaml"
+            payload = {"langcode": "en", "device": "webgpu", "batch_size": 16}
+            self.app.save_user_config(path, payload)
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+            import yaml
+
+            with path.open(encoding="utf-8") as stream:
+                self.assertEqual(yaml.safe_load(stream), payload)
+
+    def test_drop_changed_cli_overrides_keeps_untouched_keys(self):
+        overrides = {"device": "cuda", "batch_size": 32, "device_id": 1}
+        self.app.drop_changed_cli_overrides(
+            overrides,
+            {"device": "cuda", "batch_size": 32, "device_id": 1},
+            {"device": "cuda", "batch_size": 8, "device_id": 1},
+        )
+        self.assertEqual(overrides, {"device": "cuda", "device_id": 1})
 
     def test_load_ocr_models_parallel_on_cpu_serial_on_gpu(self):
         fake_ocr = Mock()

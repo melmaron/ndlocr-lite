@@ -175,6 +175,62 @@ class OrtProviderTest(unittest.TestCase):
                     model_label="PARSeq-30",
                 )
 
+    def test_invalid_device_id_is_rejected_before_session_creation(self):
+        for bad in (-1, "abc", None):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "device_id"):
+                    ort_provider.create_inference_session(
+                        "unused.onnx", device="cpu", device_id=bad
+                    )
+
+    def test_plugin_device_id_out_of_range_is_rejected(self):
+        webgpu_dev = SimpleNamespace(
+            ep_name="WebGpuExecutionProvider",
+            ep_metadata={},
+            device=SimpleNamespace(type="GPU", vendor="Vendor", device_id=0),
+        )
+        with patch.object(ort_provider, "register_plugin_eps"), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[webgpu_dev]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "out of range"):
+                ort_provider._create_session_for_backend(
+                    "unused.onnx", "webgpu", device_id=2, cpu_single_thread=False
+                )
+
+    def test_auto_with_strict_device_raises_when_gpu_init_fails(self):
+        availability = {
+            "cuda": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "migraphx": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "rocm": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "openvino": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "webgpu": {"available": True, "mode": "plugin", "devices": ["WebGPU"], "detail": "WebGPU"},
+            "dml": {"available": False, "mode": "none", "devices": [], "detail": ""},
+            "cpu": {"available": True, "mode": "builtin", "devices": ["CPU"], "detail": "CPU"},
+        }
+
+        def failing_gpu(model_path, backend, *args, **kwargs):
+            if backend == "cpu":
+                return object(), ["CPUExecutionProvider"]
+            raise RuntimeError(f"{backend} init failed")
+
+        with patch.object(ort_provider, "detect_available_backends", return_value=availability), patch.object(
+            ort_provider, "_create_session_for_backend", side_effect=failing_gpu
+        ):
+            with self.assertRaisesRegex(RuntimeError, "auto"):
+                ort_provider.create_inference_session(
+                    "unused.onnx", device="auto", strict_device=True
+                )
+
+        stderr = io.StringIO()
+        with patch.object(ort_provider, "detect_available_backends", return_value=availability), patch.object(
+            ort_provider, "_create_session_for_backend", side_effect=failing_gpu
+        ), contextlib.redirect_stderr(stderr):
+            _, profile = ort_provider.create_inference_session(
+                "unused.onnx", device="auto", strict_device=False
+            )
+        self.assertEqual(profile.active_backend, "cpu")
+        self.assertTrue(profile.fallback_occurred)
+
     def test_format_device_diagnostics_contains_summary(self):
         report = ort_provider.format_device_diagnostics()
         self.assertIn("NDLOCR-Lite GPU / ONNX Runtime Diagnostics", report)

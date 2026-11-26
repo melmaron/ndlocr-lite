@@ -109,10 +109,6 @@ def _make_ocr_args(
         check_device=False,
         json_only=False,
         enable_tcy=enable_tcy,
-        tcy_digits_only=False,
-        tcy_vertical_threshold=1.5,
-        tcy_max_chars=2,
-        tcy_min_conf=0.35,
     )
 
 

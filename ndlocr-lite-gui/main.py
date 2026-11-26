@@ -351,7 +351,7 @@ def render_pdf_page_array(pdf_path: str, page_index: int, scale: float) -> 'np.n
 
 
 class ImageSelector:
-    def __init__(self, page: ft.Page, config_obj: Dict, detector=None, recognizer30=None, recognizer50=None, recognizer100=None, table_feature=None, table_recognizer=None, outputdirpath=None, width: int = 600, height: int = 600):
+    def __init__(self, page: ft.Page, config_obj: Dict, detector=None, recognizer30=None, recognizer50=None, recognizer100=None, table_feature=None, table_recognizer=None, outputdirpath=None, width: int = 600, height: int = 600, busy_tracker=None):
         self.cnt = 0
         self.page = page
         self.config_obj = config_obj
@@ -369,6 +369,7 @@ class ImageSelector:
         self.recognizer100 = recognizer100
         self.table_feature = table_feature
         self.table_recognizer = table_recognizer
+        self.busy_tracker = busy_tracker
 
         self.start_x = 0
         self.start_y = 0
@@ -608,6 +609,8 @@ class ImageSelector:
         inputname = os.path.basename(outputcroppedpath or self.outputcroppedpath)
 
         npimg = np.array(im_crop)
+        if self.busy_tracker is not None:
+            self.busy_tracker.enter()
         try:
             page_result = await asyncio.to_thread(
                 ocr._run_ocr_on_image_array,
@@ -659,6 +662,8 @@ class ImageSelector:
             self.result_plain_text.value = f'エラーが発生しました: {ex}'
             self.resulttext.value = f'エラーが発生しました: {ex}'
         finally:
+            if self.busy_tracker is not None:
+                self.busy_tracker.leave()
             self.cropocr_btn.disabled = False
             self.open_result_page()
             self.page.update()
@@ -669,7 +674,7 @@ class ImageSelector:
 
 
 class CaptureTool:
-    def __init__(self, page: ft.Page, config_obj: Dict, detector=None, recognizer30=None, recognizer50=None, recognizer100=None, table_feature=None, table_recognizer=None, width: int = 400, height: int = 300):
+    def __init__(self, page: ft.Page, config_obj: Dict, detector=None, recognizer30=None, recognizer50=None, recognizer100=None, table_feature=None, table_recognizer=None, width: int = 400, height: int = 300, busy_tracker=None):
         self.page = page
         self.config_obj = config_obj
         self.langcode = config_obj['langcode']
@@ -679,6 +684,7 @@ class CaptureTool:
         self.recognizer100 = recognizer100
         self.table_feature = table_feature
         self.table_recognizer = table_recognizer
+        self.busy_tracker = busy_tracker
         self.dialog_width = width
         self.dialog_height = height
         self.im_crop = None
@@ -940,6 +946,8 @@ class CaptureTool:
     async def mini_ocr(self, e):
         if self.im_crop is None:
             return
+        if self.busy_tracker is not None:
+            self.busy_tracker.enter()
         self.ocr_btn.disabled = True
         self.resultsmessage.value = ''
         self.page.update()
@@ -997,6 +1005,8 @@ class CaptureTool:
             self.resulttext.value = f'エラーが発生しました: {e}'
             self.open_result_page()
         finally:
+            if self.busy_tracker is not None:
+                self.busy_tracker.leave()
             self.ocr_btn.disabled = False
             self.page.update()
 
@@ -1062,7 +1072,10 @@ def resolve_gui_engine_args(args, config_obj, cli_overrides=None):
     device_id = overrides.get('device_id') if 'device_id' in overrides else config_obj.get('device_id', 0)
     batch_size = overrides.get('batch_size') if 'batch_size' in overrides else config_obj.get('batch_size', 0)
 
-    args.device = normalize_device_name(device)
+    normalized_device = normalize_device_name(device)
+    if normalized_device not in DEVICE_CHOICES:
+        normalized_device = 'auto'
+    args.device = normalized_device
     try:
         args.device_id = max(0, int(device_id))
     except (TypeError, ValueError):
@@ -1084,6 +1097,74 @@ def format_gui_engine_status(detector, recognizer, langcode='ja'):
     bs_text = f', batch={bs}' if isinstance(bs, int) and bs > 1 else ''
     fb_text = ' [fallback]' if getattr(profile, 'fallback_occurred', False) else ''
     return f'{prefix}: {profile.display_name}{bs_text}{fb_text}'
+
+
+
+class BusyTracker:
+    """Track long-running OCR work so UI/engine changes can be deferred."""
+
+    def __init__(self):
+        self._active = 0
+
+    def enter(self):
+        self._active += 1
+
+    def leave(self):
+        self._active = max(0, self._active - 1)
+
+    @property
+    def active(self):
+        return self._active > 0
+
+
+def load_user_config(path, defaults):
+    """Read userconf.yaml defensively, returning (config, warning_or_None)."""
+    merged = dict(defaults)
+    warning = None
+    path = Path(path)
+    try:
+        if path.exists():
+            with path.open(encoding='utf-8') as stream:
+                loaded = yaml.safe_load(stream)
+            if loaded is None:
+                loaded = {}
+            if not isinstance(loaded, dict):
+                warning = f'user config is not a mapping: {type(loaded).__name__}'
+            else:
+                merged.update(loaded)
+    except Exception as exc:
+        warning = f'failed to load user config: {exc}'
+    if merged.get('langcode') not in TRANSLATIONS:
+        merged['langcode'] = 'ja'
+    return merged, warning
+
+
+def save_user_config(path, config_obj):
+    """Write userconf.yaml atomically so a crash cannot truncate it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + '.tmp')
+    with tmp_path.open('w', encoding='utf-8') as stream:
+        yaml.dump(config_obj, stream, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp_path, path)
+
+
+def parse_pdf_dpi(value, default=300.0, minimum=1.0):
+    """Parse a user-supplied PDF DPI, clamping invalid values to a safe default."""
+    try:
+        dpi = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if dpi != dpi or dpi <= 0:
+        return float(default)
+    return max(float(minimum), dpi)
+
+
+def drop_changed_cli_overrides(cli_overrides, old_values, new_values):
+    """Forget CLI overrides only for engine keys the dialog actually changed."""
+    for key, new_value in new_values.items():
+        if old_values.get(key) != new_value:
+            cli_overrides.pop(key, None)
 
 
 def main(page: ft.Page, args=None, download_models=False):
@@ -1108,14 +1189,9 @@ def main(page: ft.Page, args=None, download_models=False):
     for feature in (DATA_POOL_FEATURE, LLM_FEATURE, TABLE_STRUCTURE_FEATURE):
         if feature is not None:
             default_config.update(feature.default_config())
-    load_obj = {}
-    if USER_CONFIG_PATH.exists():
-        with USER_CONFIG_PATH.open(encoding='utf-8') as f:
-            load_obj = yaml.safe_load(f)
-        if load_obj is None:
-            load_obj = {}
-
-    config_obj = default_config | load_obj
+    config_obj, config_warning = load_user_config(USER_CONFIG_PATH, default_config)
+    if config_warning:
+        print(f'[WARN] {config_warning}')
     resolve_gui_engine_args(args, config_obj, cli_overrides)
 
     page.locale_configuration = ft.LocaleConfiguration(
@@ -1127,11 +1203,15 @@ def main(page: ft.Page, args=None, download_models=False):
     )
 
     def save_config():
-        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with USER_CONFIG_PATH.open('w', encoding='utf-8') as wf:
-            yaml.dump(config_obj, wf, default_flow_style=False, allow_unicode=True)
+        save_user_config(USER_CONFIG_PATH, config_obj)
 
     def handle_locale_change(e):
+        if busy_tracker.active or model_state['loading']:
+            # Rebuilding the view while OCR tasks hold controls would orphan
+            # dialogs and detached controls; ignore the switch while busy.
+            e.control.selected_index = 0 if config_obj.get('langcode', 'ja') == 'ja' else 1
+            page.update()
+            return
         index = e.control.selected_index
         if index == 0:
             page.locale_configuration.current_locale = ft.Locale('ja', 'JP')
@@ -1148,6 +1228,8 @@ def main(page: ft.Page, args=None, download_models=False):
     origin_recognizer50 = None
     origin_table_recognizer = None
     model_state = {'loading': False, 'error': None, 'table_error': None, 'elapsed': None}
+    busy_tracker = BusyTracker()
+    pending_engine_reload = {'pending': False}
 
     def renderui():
         page.on_keyboard_event = None
@@ -1284,16 +1366,17 @@ def main(page: ft.Page, args=None, download_models=False):
             os.makedirs(PDFTMPPATH, exist_ok=True)
             doc = pypdfium2.PdfDocument(pdf_path)
             try:
-                pdfarray = doc.render(
-                    pypdfium2.PdfBitmap.to_pil,
-                    page_indices=[i for i in range(len(doc))],
-                    scale=100 / 72,
-                )
-                for ix, image in enumerate(list(pdfarray)):
+                for ix in range(len(doc)):
+                    rendered = doc.render(
+                        pypdfium2.PdfBitmap.to_pil,
+                        page_indices=[ix],
+                        scale=100 / 72,
+                    )
+                    image = next(iter(rendered)).convert('RGB')
                     outputtmppath = os.path.join(PDFTMPPATH, '{}_{:05}.jpg'.format(filestem, ix))
                     inputpathlist.append(outputtmppath)
-                    image = image.convert('RGB')
                     image.save(outputtmppath)
+                    image.close()
             finally:
                 doc.close()
 
@@ -1325,10 +1408,37 @@ def main(page: ft.Page, args=None, download_models=False):
             if datapool_batch_extension is not None:
                 datapool_batch_extension.set_external_busy(flag)
 
+        def start_engine_reload():
+            nonlocal origin_detector, origin_recognizer
+            nonlocal origin_recognizer30, origin_recognizer50
+            nonlocal origin_table_recognizer
+            if model_state['loading'] or busy_tracker.active:
+                # Never swap sessions under a running OCR task; reload once it ends.
+                pending_engine_reload['pending'] = True
+                return
+            resolve_gui_engine_args(args, config_obj, cli_overrides)
+            origin_detector = None
+            origin_recognizer = None
+            origin_recognizer30 = None
+            origin_recognizer50 = None
+            origin_table_recognizer = None
+            model_state['error'] = None
+            model_state['loading'] = True
+            set_model_loading_lock(True)
+            parts_control(True)
+            progressbar.value = None
+            engine_status_text.value = TRANSLATIONS['engine_status_loading'][config_obj['langcode']]
+            if config_obj['langcode'] == 'ja':
+                set_progress_message('OCRモデルを再読み込み中…')
+            else:
+                set_progress_message('Reloading OCR models…')
+            page.update()
+            page.run_task(initialize_models)
+
         async def process_pdf_with_original_layer(pdf_path: str, outputpath: str, alljsonobjlist: list, pdf_outpath_list: list, allsum: int):
             pdf_path_obj = Path(pdf_path)
             output_stem = pdf_path_obj.stem
-            render_dpi = max(float(pdf_resolution_textfield.value), 1.0)
+            render_dpi = parse_pdf_dpi(pdf_resolution_textfield.value)
             render_scale = render_dpi / 72.0
 
             pdf_doc = pypdfium2.PdfDocument(str(pdf_path_obj))
@@ -1501,7 +1611,8 @@ def main(page: ft.Page, args=None, download_models=False):
 
             if chkbx_pdf.value:
                 output_pdf = os.path.join(outputpath, output_stem + '_text.pdf')
-                ocr.embed_text_layer_pdf(
+                await asyncio.to_thread(
+                    ocr.embed_text_layer_pdf,
                     input_pdf=str(pdf_path_obj),
                     output_pdf=output_pdf,
                     page_results=page_results,
@@ -1534,6 +1645,7 @@ def main(page: ft.Page, args=None, download_models=False):
 
             preview_index = 0
             parts_control(True,allow_ocr_cancel=True)
+            busy_tracker.enter()
             page.update()
             set_progress_message('Start')
             progressmessage.update()
@@ -1699,7 +1811,7 @@ def main(page: ft.Page, args=None, download_models=False):
                                 img,
                                 resjsonarray,
                                 chkbx_pdf_viztxt.value,
-                                resolution=int(pdf_resolution_textfield.value),
+                                resolution=int(parse_pdf_dpi(pdf_resolution_textfield.value)),
                             )
                             pdf_outpath_list.append(pdf_outpath)
 
@@ -1801,8 +1913,12 @@ def main(page: ft.Page, args=None, download_models=False):
                 progressmessage.update()
             finally:
                 ocr_cancel_event.clear()
+                busy_tracker.leave()
                 parts_control(False)
                 page.update()
+                if pending_engine_reload['pending'] and not busy_tracker.active:
+                    pending_engine_reload['pending'] = False
+                    start_engine_reload()
 
         async def pick_files_result(e):
             files = await file_picker.pick_files(allow_multiple=False)
@@ -1825,17 +1941,23 @@ def main(page: ft.Page, args=None, download_models=False):
                         set_progress_message('preprocessing pdf…… {} '.format(selected_file_path))
                     parts_control(True)
                     page.update()
-                    for p in glob.glob(os.path.join(PDFTMPPATH, '*.jpg')):
-                        if os.path.isfile(p):
-                            os.remove(p)
-                    os.makedirs(PDFTMPPATH, exist_ok=True)
-                    await asyncio.to_thread(render_pdf_preview, selected_file_path, filestem)
-                    if config_obj['langcode'] == 'ja':
-                        set_progress_message('pdfファイルの前処理完了')
-                    else:
-                        set_progress_message('Preprocessing of pdf complete')
-                    parts_control(False)
-                    page.update()
+                    try:
+                        for p in glob.glob(os.path.join(PDFTMPPATH, '*.jpg')):
+                            if os.path.isfile(p):
+                                os.remove(p)
+                        os.makedirs(PDFTMPPATH, exist_ok=True)
+                        await asyncio.to_thread(render_pdf_preview, selected_file_path, filestem)
+                        if config_obj['langcode'] == 'ja':
+                            set_progress_message('pdfファイルの前処理完了')
+                        else:
+                            set_progress_message('Preprocessing of pdf complete')
+                    except Exception as err:
+                        print(f'PDF preprocessing failed: {err}')
+                        pdf_job_list.remove(selected_file_path) if selected_file_path in pdf_job_list else None
+                        set_progress_message(f'PDF前処理エラー: {err}')
+                    finally:
+                        parts_control(False)
+                        page.update()
                 else:
                     inputpathlist.append(selected_file_path)
                 selector.set_image(inputpathlist)
@@ -1915,9 +2037,10 @@ def main(page: ft.Page, args=None, download_models=False):
                     set_progress_message('Processing complete')
 
                 selector.set_image(inputpathlist)
-
-                if len(inputpathlist) > 0:
-                    parts_control(False)
+                if not inputpathlist and not pdf_job_list:
+                    set_progress_message('処理可能なファイルが見つかりませんでした / No processable files found')
+                # Restore the UI even for empty directories or failed PDF previews.
+                parts_control(False)
 
             selected_input_path.update()
             page.update()
@@ -2034,7 +2157,7 @@ def main(page: ft.Page, args=None, download_models=False):
                 'pdf_viztxt': chkbx_pdf_viztxt.value,
                 'pdf_merge': chkbx_pdf_merge.value,
                 'pdf_page_output': chkbx_pdf_page_output.value,
-                'pdf_resolution': int(pdf_resolution_textfield.value),
+                'pdf_resolution': int(parse_pdf_dpi(pdf_resolution_textfield.value)),
                 'text_daisy': chkbx_text_daisy.value,
                 'character_inclusion': chkbx_character_inclusion.value,
                 'device': new_device,
@@ -2049,26 +2172,20 @@ def main(page: ft.Page, args=None, download_models=False):
                 page.pop_dialog()
 
             if engine_changed:
-                for key in ('device', 'batch_size', 'device_id'):
-                    cli_overrides.pop(key, None)
-                resolve_gui_engine_args(args, config_obj, cli_overrides)
-                if not model_state['loading'] and stop_ocr_btn.disabled:
-                    origin_detector = None
-                    origin_recognizer = None
-                    origin_recognizer30 = None
-                    origin_recognizer50 = None
-                    origin_table_recognizer = None
-                    model_state['loading'] = True
-                    set_model_loading_lock(True)
-                    parts_control(True)
-                    progressbar.value = None
-                    engine_status_text.value = TRANSLATIONS['engine_status_loading'][config_obj['langcode']]
-                    if config_obj['langcode'] == 'ja':
-                        set_progress_message('OCRモデルを再読み込み中…')
-                    else:
-                        set_progress_message('Reloading OCR models…')
-                    page.update()
-                    page.run_task(initialize_models)
+                drop_changed_cli_overrides(
+                    cli_overrides,
+                    {
+                        'device': args.device,
+                        'batch_size': int(getattr(args, 'batch_size', 0)),
+                        'device_id': int(getattr(args, 'device_id', 0)),
+                    },
+                    {
+                        'device': new_device,
+                        'batch_size': new_batch_size,
+                        'device_id': new_device_id,
+                    },
+                )
+                start_engine_reload()
 
         def change_pdfstatus(e):
             chkbx_pdf_viztxt.disabled = not chkbx_pdf.value
@@ -2483,6 +2600,7 @@ def main(page: ft.Page, args=None, download_models=False):
             table_feature=TABLE_STRUCTURE_FEATURE,
             table_recognizer=origin_table_recognizer,
             outputdirpath=selected_output_path.value,
+            busy_tracker=busy_tracker,
         )
 
         capture_tool = CaptureTool(
@@ -2494,6 +2612,7 @@ def main(page: ft.Page, args=None, download_models=False):
             recognizer100=origin_recognizer,
             table_feature=TABLE_STRUCTURE_FEATURE,
             table_recognizer=origin_table_recognizer,
+            busy_tracker=busy_tracker,
         )
         if selected_output_path.value:
             capture_tool.outputdirpath = selected_output_path.value
@@ -2874,10 +2993,12 @@ def main(page: ft.Page, args=None, download_models=False):
                         set_progress_message(f'OCR models ready / TableInfer models unavailable ({model_state["elapsed"]:.1f} sec)')
             except Exception as ex:
                 model_state['error'] = ex
+                pending_engine_reload['pending'] = False
                 progressbar.value = 0
-                engine_status_text.value = format_gui_engine_status(
-                    origin_detector, origin_recognizer, config_obj['langcode']
-                )
+                if config_obj['langcode'] == 'ja':
+                    engine_status_text.value = '実行エンジン: 初期化失敗'
+                else:
+                    engine_status_text.value = 'Engine: initialization failed'
                 set_progress_message(f'OCR model initialization failed: {ex}')
             finally:
                 model_state['loading'] = False
@@ -2886,6 +3007,13 @@ def main(page: ft.Page, args=None, download_models=False):
                 set_model_loading_lock(False)
                 parts_control(False)
                 page.update()
+                if (
+                    pending_engine_reload['pending']
+                    and not busy_tracker.active
+                    and model_state.get('error') is None
+                ):
+                    pending_engine_reload['pending'] = False
+                    start_engine_reload()
 
         if models_are_ready():
             set_model_loading_lock(False)

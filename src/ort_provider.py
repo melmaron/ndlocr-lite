@@ -406,7 +406,12 @@ def _create_session_for_backend(
     if backend == "openvino":
         gpu_devs = _find_plugin_devices_for_backend("openvino", ep_devices)
         if gpu_devs:
-            chosen = gpu_devs[device_id] if 0 <= device_id < len(gpu_devs) else gpu_devs[0]
+            if not 0 <= device_id < len(gpu_devs):
+                raise RuntimeError(
+                    f"Requested device_id {device_id} is out of range for OpenVINO "
+                    f"({len(gpu_devs)} GPU device(s) detected)."
+                )
+            chosen = gpu_devs[device_id]
             opt = _build_session_options(cpu_single_thread=False)
             opt.add_provider_for_devices([chosen], {})
             session = ort.InferenceSession(model_str, sess_options=opt)
@@ -430,7 +435,12 @@ def _create_session_for_backend(
     if backend == "webgpu":
         webgpu_devs = _find_plugin_devices_for_backend("webgpu", ep_devices)
         if webgpu_devs:
-            chosen = webgpu_devs[device_id] if 0 <= device_id < len(webgpu_devs) else webgpu_devs[0]
+            if not 0 <= device_id < len(webgpu_devs):
+                raise RuntimeError(
+                    f"Requested device_id {device_id} is out of range for WebGPU "
+                    f"({len(webgpu_devs)} adapter(s) detected)."
+                )
+            chosen = webgpu_devs[device_id]
             ep_name = str(chosen.ep_name)
             opt = _build_session_options(cpu_single_thread=False)
             opt.add_provider_for_devices([chosen], {})
@@ -503,6 +513,12 @@ def create_inference_session(
 ) -> Tuple[ort.InferenceSession, BackendProfile]:
     """Create an ONNX Runtime InferenceSession for the requested device or 'auto'."""
     requested = normalize_device_name(device)
+    try:
+        device_id = int(device_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"device_id must be an integer, got {device_id!r}") from exc
+    if device_id < 0:
+        raise ValueError(f"device_id must be >= 0, got {device_id}")
     if requested not in DEVICE_CHOICES:
         raise ValueError(
             f"Unsupported device '{device}'. Choose from: {', '.join(DEVICE_CHOICES)}"
@@ -531,6 +547,12 @@ def create_inference_session(
                 )
             except Exception as exc:
                 failures.append(f"{candidate}: {exc}")
+
+        if failures and strict_device:
+            raise RuntimeError(
+                f"'--device auto' could not initialize any GPU backend for {model_label}: "
+                + "; ".join(failures)
+            )
 
         session, active_providers = _create_session_for_backend(
             model_path,

@@ -19,7 +19,7 @@ import glob
 from functools import lru_cache
 from reading_order.xy_cut.eval import eval_xml
 from reading_order.xy_cut.block_xy_cut import solve as solve_reading_order
-from ndl_parser import convert_to_xml_string3
+from ndl_parser import convert_to_xml_string3, name_to_org_name
 from ort_provider import DEVICE_CHOICES, format_device_diagnostics
 from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
 from version import __version__
@@ -668,6 +668,23 @@ def _supports_batch_rec(recognizer) -> bool:
     )
 
 
+def _org_name_class_index(classeslist) -> dict:
+    """Map Japanese XML ``TYPE`` values back to detector class indexes.
+
+    ``convert_to_xml_string3`` writes the localized ``org_name`` (for example
+    ``キャプション``) into ``LINE@TYPE``, while ``classeslist`` holds the English
+    YAML names (``line_caption``). Looking ``TYPE`` up directly in the English
+    list always failed and forced ``class_index`` to the ``line_main`` fallback.
+    """
+    mapping = {}
+    for index, name in enumerate(classeslist):
+        try:
+            mapping[name_to_org_name(name)] = index
+        except KeyError:
+            continue
+    return mapping
+
+
 def _is_concurrent_session_safe(recognizer) -> bool:
     profile = getattr(recognizer, "backend_profile", None)
     if profile is None:
@@ -855,6 +872,28 @@ def _load_charlist(classes_path):
         charobj=safe_load(f)
     return tuple(charobj["model"]["charset_train"])
 
+def _build_tcy_wrapper_kwargs(args) -> dict:
+    """Return only the tate-chuu-yoko options accepted by TateChuYokoWrapper.
+
+    Older code paths added extra ``tcy_*`` attributes (for example
+    ``tcy_digits_only``) that the wrapper constructor does not accept; passing
+    them through used to raise ``TypeError`` as soon as ``--enable-tcy`` was
+    combined with such an argument namespace (see scripts/colab_verify_gpu.py).
+    """
+    import inspect
+
+    from tcy_wrapper import TateChuYokoWrapper
+
+    supported = set(
+        inspect.signature(TateChuYokoWrapper.__init__).parameters
+    ) - {"self", "recognizer"}
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key in supported and value is not None
+    }
+
+
 def get_recognizer(args,weights_path=None):
     if weights_path is None:
         weights_path = args.rec_weights
@@ -875,8 +914,9 @@ def get_recognizer(args,weights_path=None):
     )
     if getattr(args, 'enable_tcy', False):
         from tcy_wrapper import TateChuYokoWrapper
-        tcy_kwargs = {k: v for k, v in vars(args).items() if k.startswith('tcy_') and k != 'enable_tcy' and v is not None}
-        recognizer = TateChuYokoWrapper(recognizer, **tcy_kwargs)
+        recognizer = TateChuYokoWrapper(
+            recognizer, **_build_tcy_wrapper_kwargs(args)
+        )
     return recognizer
 
 def inference_on_detector(args,inputname:str,npimage:np.ndarray,outputpath:str,issaveimg:bool=True):
@@ -940,8 +980,9 @@ def _run_ocr_on_image_array(
     )
     resultobj = [dict(), dict()]
     resultobj[0][0] = list()
-    for i in range(17):
+    for i in range(len(classeslist)):
         resultobj[1][i] = []
+    class_index_by_org = _org_name_class_index(classeslist)
     for det in detections:
         xmin, ymin, xmax, ymax = det["box"]
         conf = det["confidence"]
@@ -1027,7 +1068,7 @@ def _run_ocr_on_image_array(
             conf = 0.0
 
         type_str = lineobj.get("TYPE", "")
-        c_idx = classeslist.index(type_str) if type_str in classeslist else 1
+        c_idx = class_index_by_org.get(type_str, 1)
         resjsonarray.append({
             "boundingBox": [
                 [xmin, ymin],
@@ -1332,6 +1373,10 @@ def embed_text_layer_pdf(
             normalized_page.transfer_rotation_to_content()
 
     normalized_writer.write(normalized_buffer)
+    # The serialized bytes no longer reference the per-page readers/buffers;
+    # dropping them here keeps peak memory bounded for long PDFs (the overlay
+    # stage below holds the output pages instead).
+    normalized_objects.clear()
     normalized_buffer.seek(0)
 
     normalized_reader = PdfReader(normalized_buffer)
@@ -1452,8 +1497,15 @@ def _iter_prefetched(items, produce_fn, maxsize: int = 3):
                         break
                     except queue.Full:
                         continue
-            if not stop_event.is_set():
-                q.put((_PREFETCH_DONE, None))
+            # The sentinel must also be stop-aware: a blocking put() here would
+            # leave this thread stuck forever after the consumer stops consuming
+            # (e.g. an exception while writing a page).
+            while not stop_event.is_set():
+                try:
+                    q.put((_PREFETCH_DONE, None), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
         except BaseException as exc:
             while not stop_event.is_set():
                 try:
@@ -1481,6 +1533,20 @@ def _preprocess_detector_input(detector, img: np.ndarray):
     if hasattr(detector, "preprocess_with_meta"):
         return detector.preprocess_with_meta(img)
     return None
+
+
+_MAX_PENDING_WRITES = 4
+
+
+def _track_write_future(futures, future, limit=_MAX_PENDING_WRITES):
+    """Keep at most ``limit`` writer futures in flight and surface failures early.
+
+    Without a bound, a long input list keeps every page result/viz image alive
+    until the final loop and write errors are only noticed after all OCR work.
+    """
+    futures.append(future)
+    if len(futures) >= limit:
+        futures.pop(0).result()
 
 
 def _write_image_outputs(
@@ -1607,7 +1673,8 @@ def process_pdf_documents(args, pdf_paths: list[str]):
                 all_text_pages.append(page_result["text"])
                 all_page_xml.append(page_result["page_xml"])
                 if separate_page_outputs:
-                    write_futures.append(
+                    _track_write_future(
+                        write_futures,
                         writer_pool.submit(
                             write_pdf_page_outputs,
                             args.output,
@@ -1619,7 +1686,7 @@ def process_pdf_documents(args, pdf_paths: list[str]):
                             write_xml=not getattr(args, "json_only", False),
                             write_txt=not getattr(args, "json_only", False),
                             source_dpi=render_dpi,
-                        )
+                        ),
                     )
             for fut in write_futures:
                 fut.result()
@@ -1723,8 +1790,9 @@ def process(args):
             )
             resultobj=[dict(),dict()]
             resultobj[0][0]=list()
-            for i in range(17):
+            for i in range(len(classeslist)):
                 resultobj[1][i]=[]
+            class_index_by_org = _org_name_class_index(classeslist)
             for det in detections:
                 xmin,ymin,xmax,ymax=det["box"]
                 conf=det["confidence"]
@@ -1787,7 +1855,8 @@ def process(args):
             alltextlist.append("\n".join(resultlinesall))
 
             for idx,lineobj in enumerate(root.findall(".//LINE")):
-                lineobj.set("STRING",resultlinesall[idx])
+                line_text = resultlinesall[idx] if idx < len(resultlinesall) else ""
+                lineobj.set("STRING", line_text)
                 xmin=int(lineobj.get("X"))
                 ymin=int(lineobj.get("Y"))
                 line_w=int(lineobj.get("WIDTH"))
@@ -1798,10 +1867,10 @@ def process(args):
                     conf=0.0
 
                 type_str = lineobj.get("TYPE", "")
-                c_idx = classeslist.index(type_str) if type_str in classeslist else 1
+                c_idx = class_index_by_org.get(type_str, 1)
 
                 jsonobj={"boundingBox": [[xmin,ymin],[xmin,ymin+line_h],[xmin+line_w,ymin],[xmin+line_w,ymin+line_h]],
-                    "id": idx,"isVertical": "true" if line_h > line_w else "false","text": resultlinesall[idx],"isTextline": "true","confidence": conf, "class_index": c_idx}
+                    "id": idx,"isVertical": "true" if line_h > line_w else "false","text": line_text,"isTextline": "true","confidence": conf, "class_index": c_idx}
                 resjsonarray.append(jsonobj)
 
             allxmlstr+=(ET.tostring(root.find("PAGE"), encoding='unicode')+"\n")
@@ -1819,7 +1888,8 @@ def process(args):
                 }
             }
             viz_args = (detector, imgname, img, detections) if args.viz else None
-            write_futures.append(
+            _track_write_future(
+                write_futures,
                 writer_pool.submit(
                     _write_image_outputs,
                     args.output,
@@ -1829,7 +1899,7 @@ def process(args):
                     alltextlist,
                     json_only,
                     viz_args,
-                )
+                ),
             )
             print("Total calculation time (Detection + Recognition):",time.time()-start)
 

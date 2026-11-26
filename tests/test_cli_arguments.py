@@ -6,6 +6,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from argparse import Namespace
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ocr
@@ -90,6 +92,56 @@ class CliArgumentsTest(unittest.TestCase):
         with patch.object(ocr, "main") as main:
             cli.main()
         main.assert_called_once_with(download_models=True)
+
+    def test_tcy_wrapper_kwargs_ignore_unsupported_legacy_options(self):
+        args = Namespace(
+            enable_tcy=True,
+            tcy_min_line_width=20,
+            tcy_max_aspect_ratio=0.6,
+            tcy_seg_min_gap=None,
+            # Legacy/unknown attributes used by older verification scripts.
+            tcy_digits_only=False,
+            tcy_vertical_threshold=1.5,
+            tcy_max_chars=2,
+            tcy_min_conf=0.35,
+            unrelated=1,
+        )
+        kwargs = ocr._build_tcy_wrapper_kwargs(args)
+        self.assertEqual(kwargs, {"tcy_min_line_width": 20, "tcy_max_aspect_ratio": 0.6})
+
+        from tcy_wrapper import TateChuYokoWrapper
+
+        wrapper = TateChuYokoWrapper(object(), **kwargs)
+        self.assertEqual(wrapper.min_line_width, 20)
+        self.assertEqual(wrapper.max_aspect_ratio, 0.6)
+
+    def test_get_recognizer_with_tcy_ignores_legacy_attributes(self):
+        root = Path(__file__).resolve().parents[1]
+        model = root / "src" / "model" / "parseq-ndl-24x256-30-tiny-499epoch-261124.onnx"
+        classes = root / "src" / "config" / "NDLmoji.yaml"
+        if not model.is_file() or not classes.is_file():
+            self.skipTest("Bundled PARSeq model missing")
+        args = Namespace(
+            rec_weights=str(model),
+            rec_classes=str(classes),
+            device="cpu",
+            device_id=0,
+            batch_size=1,
+            strict_device=False,
+            enable_tcy=True,
+            tcy_digits_only=False,
+            tcy_vertical_threshold=1.5,
+            tcy_max_chars=2,
+            tcy_min_conf=0.35,
+        )
+        from tcy_wrapper import TateChuYokoWrapper
+
+        with patch.object(ocr, "PARSEQ", return_value=object()), patch.object(
+            ocr, "_load_charlist", return_value=("a",)
+        ):
+            recognizer = ocr.get_recognizer(args)
+        self.assertIsInstance(recognizer, TateChuYokoWrapper)
+
 
     def test_help_and_version_do_not_download(self):
         for option in ("--help", "--version"):

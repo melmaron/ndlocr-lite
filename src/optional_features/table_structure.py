@@ -83,17 +83,25 @@ class TableStructureFeature:
 
     def write_html_files(self, document_name, page_tables, output_dir, output_stem):
         paths = []
-        for item in page_tables:
+        for item in page_tables or []:
             item.pop('html_path', None)
-            rows, cols = self.engine.table_grid_shape(item.get('cells', []))
-            if item.get('error') or (rows < 2 and cols < 2):
+            if item.get('error'):
+                continue
+            cells = item.get('cells') or []
+            rows, cols = self.engine.table_grid_shape(cells)
+            if rows < 2 and cols < 2:
                 continue
             table_index = int(item.get('table_index', 1))
             page_index = item.get('page_index')
             page_suffix = '' if page_index is None else f'_page_{int(page_index) + 1:05}'
             path = Path(output_dir) / f'{output_stem}{page_suffix}_table_{table_index:05}.html'
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(self.build_html(document_name, [item]), encoding='utf-8')
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(self.build_html(document_name, [item]), encoding='utf-8')
+            except OSError as exc:
+                # Table HTML is supplementary; never abort the OCR outputs.
+                print(f'[WARN] Failed to write table HTML {path.name}: {exc}')
+                continue
             item['html_path'] = str(path.resolve())
             paths.append(path)
         return paths
