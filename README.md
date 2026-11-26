@@ -11,7 +11,7 @@ v2.0.0 の全機能（DEIMv2 レイアウト認識、3段 PARSeq 文字認識カ
 
 ---
 
-## 上流（NDLOCR-Lite v2.0.0）からの主な拡張機能
+## 元プロジェクト（NDLOCR-Lite v2.0.0）からの主な拡張機能
 
 - **マルチベンダー GPU 自動選択 (`--device auto`)**:
   環境に応じて `cuda > migraphx > rocm > openvino (GPU) > webgpu > dml > cpu` の優先順で自動選択し、利用不可または初期化失敗時は診断ヒント付きで `cpu` へ自動フォールバックします（`--strict-device` 指定時はエラーで停止）。
