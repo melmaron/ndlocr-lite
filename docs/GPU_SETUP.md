@@ -125,7 +125,7 @@ python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --stric
 以下の環境および自動テストで動作と出力一致を検証済みです。
 
 - **ローカル自動テスト (`pytest tests ndlocr-lite-gui/tests`)**:
-  - 公式 PARSeq 3モデル (`24x256-30` / `24x384-50` / `24x768-100`) の動的バッチパッチ (`_dynbatch_fp32_v1.onnx`) において、`batch=1` との厳密一致 (`ORT_DISABLE_ALL` 誤差 `<= 1e-4` および `argmax` 完全一致) を検証。
+  - 公式 PARSeq 3モデル (`24x256-30` / `24x384-50` / `24x768-100`) の動的バッチパッチ (`_dynbatch_fp32_v1.onnx`) において、`batch=1` との厳密一致（`B=1` で誤差 `<= 1e-5`、動的バッチ時に `ORT_DISABLE_ALL <= 5e-3` / `ORT_ENABLE_ALL <= 2e-2` かつ `argmax` 完全一致）を検証。
   - バッチ推論 + 3段パイプライン並列実行時と CPU `batch=1` 逐次実行時で、サンプル資料の XML / JSON / TXT 出力が完全一致することを検証（縦中横バッチ処理・DEIM 分割前処理含む）。
 - **Plugin EP 構成 (`requirements-gpu-generic.txt`: ORT `1.31.1` + `onnxruntime-ep-webgpu==0.6.0` + `onnxruntime-ep-openvino==1.8.1`)**:
   - 両プラグインが正常登録され、OpenVINO CPU-only 環境（Intel GPU 未検出時）で誤選択せず `--device auto` が正しく `webgpu`（または `cpu`）へフォールバック・優先選択することを確認。

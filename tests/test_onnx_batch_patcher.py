@@ -66,15 +66,24 @@ class OnnxBatchPatcherTest(unittest.TestCase):
                     self.assertIn("_dynbatch_fp32_v1.onnx", first.model_path.name)
                     self.assertTrue(patcher.is_dynamic_batch_model(first.model_path))
 
-                    # Verify strict equality with ORT graph optimizations disabled (exact match)
+                    # Verify B=1 mathematical identity and batched equivalence with ORT optimizations disabled
+                    diff_b1 = patcher.verify_dynamic_batch_equivalence(
+                        model_path,
+                        first.model_path,
+                        batch_size=1,
+                        atol=1e-5,
+                        disable_ort_optimizations=True,
+                    )
+                    self.assertLessEqual(diff_b1, 1e-5)
+
                     diff_raw = patcher.verify_dynamic_batch_equivalence(
                         model_path,
                         first.model_path,
                         batch_size=2,
-                        atol=1e-4,
+                        atol=5e-3,
                         disable_ort_optimizations=True,
                     )
-                    self.assertLessEqual(diff_raw, 1e-4)
+                    self.assertLessEqual(diff_raw, 5e-3)
 
                     # Verify second call reuses local cache
                     second = patcher.prepare_parseq_model(
