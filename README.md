@@ -18,6 +18,25 @@
 
 ---
 
+## ダウンロード
+
+GUI デスクトップアプリケーションのビルド済みパッケージは、**[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite/releases)** からダウンロードできます（最新の開発ビルドは [GitHub Actions (`build-flet-cross`)](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml) の Artifacts からも入手可能です）。
+
+| OS | GPU / 環境 | ダウンロード対象ファイル名 |
+|---|---|---|
+| **Windows** | NVIDIA GPU (CUDA) | `ndlocr_lite_v*_windows_cuda.zip` |
+| **Windows** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_v*_windows_gpu_generic.zip` |
+| **Linux** | NVIDIA GPU (CUDA) | `ndlocr_lite_v*_linux_cuda.tar.gz` |
+| **Linux** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_v*_linux_gpu_generic.tar.gz` |
+| **macOS** | Apple Silicon (M シリーズ) | `ndlocr_lite_v*_macos_apple_silicon.tar.gz` |
+| **macOS** | Intel Mac | `ndlocr_lite_v*_macos_intel.tar.gz` |
+
+> [!NOTE]
+> - 展開後のフォルダは **日本語（全角文字）を含まないパス**（例: `C:\ndlocr-lite\`）に配置して起動してください。
+> - CLI 版や Python ソースから直接実行したい場合は、下の [セットアップと使い方](#セットアップと使い方) を参照してください。
+
+---
+
 ## 本家との違い
 
 v2.0.0 標準の PDF 入出力・縦中横 (`--enable-tcy`)・表構造認識 (`TableCenterNet`)・Flet GUI はそのまま引き継ぎつつ、推論バックエンドとパイプラインを拡張した。
@@ -35,6 +54,38 @@ v2.0.0 標準の PDF 入出力・縦中横 (`--enable-tcy`)・表構造認識 (`
 ---
 
 ## ベンチマーク
+
+### デスクトップ NVIDIA GeForce RTX 3070 8GB (Windows 11 / WSL2 Ubuntu)
+
+AMD Ryzen 7 5800X + NVIDIA GeForce RTX 3070 (`8192 MiB`, ドライバ `617.42`, Python `3.12.16`) 実機で、同梱 `resource/` 画像を循環させた **12 ページ連続処理**を計測した結果です（詳細条件と再現手順は [GPU セットアップガイド](./docs/GPU_SETUP.md) 第 5 節）。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/benchmark-rtx3070-dark.svg">
+    <img alt="Desktop RTX 3070 12-page OCR benchmark: comparing conventional CPU/GPU batch=1 vs this fork dynamic batch and 3-stage pipeline on Windows 11" src="./docs/assets/benchmark-rtx3070-light.svg" width="100%">
+  </picture>
+</p>
+
+| 環境 / モード | ORT 版 | 一括 12p (初期化込) | 一括速度 | 定常 12p (初期化・warmup 除) | 定常速度 | VRAM 増分 (定常) |
+|---|---|---|---|---|---|---|
+| Windows 11 / CPU `batch=1`（従来相当） | `1.31.1` | 23.190 秒 | 0.517 p/s | 11.961 秒 | 1.003 p/s | — |
+| Windows 11 / CUDA 13 `batch=1`（従来相当） | `1.31.1` | 28.108 秒 | 0.427 p/s | 16.563 秒 | 0.724 p/s | +988 MiB |
+| Windows 11 / CUDA 13 動的 `batch=8` + 並列 | `1.31.1` | 13.279 秒 | 0.904 p/s | 3.893 秒 | 3.082 p/s | +1,037 MiB |
+| Windows 11 / CUDA 13 動的 `batch=16` + 並列 | `1.31.1` | 12.171 秒 | 0.986 p/s | 2.875 秒 | 4.173 p/s | +1,153 MiB |
+| Windows 11 / CUDA 13 動的 `batch=32` + 並列 | `1.31.1` | **12.055 秒** | **0.995 p/s** | **2.537 秒** | **4.730 p/s** | +1,547 MiB |
+| Windows 11 / CUDA 12 動的 `batch=32` + 並列 | `1.29.0` | 12.626 秒 | 0.950 p/s | 3.019 秒 | 3.975 p/s | +1,607 MiB |
+| Windows 11 / DML ハイブリッド `batch=32` | `1.24.4` | 27.901 秒 | 0.430 p/s | 17.114 秒 | 0.701 p/s | +598 MiB |
+| WSL2 Ubuntu / CPU `batch=1`（従来相当） | `1.31.1` | 19.452 秒 | 0.617 p/s | 14.856 秒 | 0.808 p/s | — |
+| WSL2 Ubuntu / CUDA 13 動的 `batch=16` + 並列 | `1.31.1` | **8.946 秒** | **1.341 p/s** | 2.943 秒 | 4.077 p/s | +1,331 MiB |
+| WSL2 Ubuntu / CUDA 13 動的 `batch=32` + 並列 | `1.31.1` | 9.509 秒 | 1.262 p/s | **2.794 秒** | **4.295 p/s** | +1,613 MiB |
+| WSL2 Ubuntu / CUDA 12 動的 `batch=32` + 並列 | `1.29.0` | **8.340 秒** | **1.439 p/s** | 3.047 秒 | 3.939 p/s | +1,561 MiB |
+
+- **従来版に対する大幅な高速化**: 高速なデスクトップ CPU 環境では従来の `CUDA batch=1`（定常 `16.563 秒`）は `CPU batch=1`（`11.961 秒`）より遅くなることがありましたが、本フォークの動的バッチ＋3段パイプラインにより Windows 11 で **定常 `2.537 秒`（従来 CPU 比 4.71x、従来 GPU 比 6.53x）**、一括 12p でも **`12.055 秒`（WSL2 では最短 `8.340 秒`）** まで短縮しています
+- **VRAM 節約と速度のバランス**: `--batch-size 16` でも Windows 11 で定常 `4.173 p/s`・WSL2 で一括 `8.946 秒` と高い性能を維持しつつ VRAM 増分を約 `300〜400 MiB` 抑えられるため、4 GB 級 VRAM GPU にも向きます
+- **出力一致と各バックエンド検証**: Windows 11 / WSL2 の CUDA 13 (`ORT 1.31.1`)・CUDA 12 (`ORT 1.29.0`)・DirectML ハイブリッド (`ORT 1.24.4`: `DEIM CPU + PARSeq DML`) のすべてで、同梱 5 画像（通常・`--enable-tcy`）および 3 ページ PDF E2E の CPU `batch=1` 完全一致（差分 0）を確認済みです（`TableCenterNet v3` の CUDA 動作・同一 3 セル出力も検証済み）
+
+<details>
+<summary>参考実測: クラウド環境 Google Colab T4 Standard (Tesla T4 15GB)</summary>
 
 Google Colab T4 Standard（`Tesla T4 15360 MiB`、NVIDIA driver `580.82.07`、`Python 3.13.16`、`onnxruntime-gpu==1.31.1`）上で、同梱 `resource/` 画像を循環させた **12 ページ連続処理**を計測した結果（詳細条件と再現手順は [GPU セットアップガイド](./docs/GPU_SETUP.md) 第 5 節）。
 
@@ -60,22 +111,7 @@ Google Colab T4 Standard（`Tesla T4 15360 MiB`、NVIDIA driver `580.82.07`、`P
 - **定常推論の高速化**: モデル初期化を除いた定常推論では `batch=32` が `3.876 秒`（CUDA `batch=1` 比 **3.25x**、CPU 比約 **20.6x**）。`--batch-size 16` でも定常速度の約 98%（`3.026 p/s`）・一括最速（`14.477 秒`）を保ちつつ VRAM を `382 MiB` 抑えられるため、4 GB 級 VRAM GPU にも向く
 - **出力一致と TableCenterNet 検証**: 同梱 `resource/` 5 画像（225 行、`--enable-tcy` off/on 双方）および 12 ページ一括で、CUDA 動的バッチと `CPU batch=1` の TXT / XML / JSON 出力が完全一致（差分 0）。TableCenterNet v3（`DeformConv`）も CUDA 上で CPU フォールバックなしに同一セル数（合成表 3 セル）を確認済み
 
-### 参考実測: デスクトップ NVIDIA GeForce RTX 3070 8GB (Windows 11 / WSL2 Ubuntu)
-
-AMD Ryzen 7 5800X + NVIDIA GeForce RTX 3070 (`8192 MiB`, ドライバ `617.42`, Python `3.12.16`) 実機でも、全 CUDA 13 (`ORT 1.31.1`)・CUDA 12 (`ORT 1.29.0`)・DirectML ハイブリッド (`ORT 1.24.4`: `DEIM CPU + PARSeq DML`) で 5 画像（通常・縦中横）および 3 ページ PDF E2E の CPU `batch=1` 完全一致（差分 0）を確認済みです（詳細は [GPU セットアップガイド](./docs/GPU_SETUP.md) 第 5 節）。
-
-| 環境 / モード | ORT 版 | 一括 12p (初期化込) | 定常 12p (初期化・warmup 除) | 定常速度 | VRAM 増分 (定常) |
-|---|---|---|---|---|---|
-| Windows 11 / CPU `batch=1` | `1.31.1` | 23.190 秒 | 11.961 秒 | 1.003 p/s | — |
-| Windows 11 / CUDA 13 `batch=1` | `1.31.1` | 28.108 秒 | 16.563 秒 | 0.724 p/s | +988 MiB |
-| Windows 11 / CUDA 13 動的 `batch=16` | `1.31.1` | 12.171 秒 | 2.875 秒 | 4.173 p/s | +1,153 MiB |
-| Windows 11 / CUDA 13 動的 `batch=32` | `1.31.1` | **12.055 秒** | **2.537 秒** | **4.730 p/s** | +1,547 MiB |
-| Windows 11 / CUDA 12 動的 `batch=32` | `1.29.0` | 12.626 秒 | 3.019 秒 | 3.975 p/s | +1,607 MiB |
-| Windows 11 / DML ハイブリッド `batch=32` | `1.24.4` | 27.901 秒 | 17.114 秒 | 0.701 p/s | +598 MiB |
-| WSL2 Ubuntu / CPU `batch=1` | `1.31.1` | 19.452 秒 | 14.856 秒 | 0.808 p/s | — |
-| WSL2 Ubuntu / CUDA 13 動的 `batch=16` | `1.31.1` | **8.946 秒** | 2.943 秒 | 4.077 p/s | +1,331 MiB |
-| WSL2 Ubuntu / CUDA 13 動的 `batch=32` | `1.31.1` | 9.509 秒 | **2.794 秒** | **4.295 p/s** | +1,613 MiB |
-| WSL2 Ubuntu / CUDA 12 動的 `batch=32` | `1.29.0` | **8.340 秒** | 3.047 秒 | 3.939 p/s | +1,561 MiB |
+</details>
 
 ---
 

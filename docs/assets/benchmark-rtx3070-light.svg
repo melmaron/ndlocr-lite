@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 448" width="880" height="448" role="img" aria-labelledby="rtx3070-title rtx3070-desc">
+  <title id="rtx3070-title">デスクトップ RTX 3070 8GB 高速化ベンチマーク — 12ページ処理 (Windows 11)</title>
+  <desc id="rtx3070-desc">Light theme comparison of 12-page OCR latency and VRAM on desktop Ryzen 7 5800X + NVIDIA GeForce RTX 3070 8GB comparing conventional CPU/GPU batch=1 against this fork with dynamic batching and 3-stage pipeline.</desc>
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", "Noto Sans JP", Helvetica, Arial, sans-serif; }
+    .title { font-size: 16px; font-weight: 700; fill: #1f2328; }
+    .subtitle { font-size: 11.5px; fill: #59636e; }
+    .legend { font-size: 11px; font-weight: 600; fill: #1f2328; }
+    .card-title { font-size: 13.5px; font-weight: 700; fill: #1f2328; }
+    .card-sub { font-size: 11px; fill: #59636e; }
+    .row-label { font-size: 11.5px; fill: #1f2328; }
+    .row-label-bold { font-size: 11.5px; font-weight: 600; fill: #1f2328; }
+    .row-val { font-size: 11.5px; font-weight: 600; fill: #1f2328; }
+    .row-val-best { font-size: 11.5px; font-weight: 700; fill: #116329; }
+    .pill-text { font-size: 11px; font-weight: 600; fill: #116329; }
+    .pill-text-info { font-size: 11px; font-weight: 600; fill: #0550ae; }
+    .footer { font-size: 10.5px; fill: #59636e; }
+  </style>
+
+  <!-- Canvas -->
+  <rect x="0.5" y="0.5" width="879" height="447" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+
+  <!-- Header -->
+  <text x="20" y="30" class="sans title">デスクトップ RTX 3070 8GB 高速化ベンチマーク — 12ページ連続処理 (Windows 11)</text>
+  <text x="20" y="49" class="sans subtitle">AMD Ryzen 7 5800X + NVIDIA GeForce RTX 3070 8GB · ONNX Runtime GPU 1.31.1 (CUDA 13) · FP32 出力差分 0</text>
+
+  <!-- Legend -->
+  <circle cx="26" cy="67" r="4.5" fill="#8c959f"/>
+  <text x="35" y="71" class="sans legend">従来（本家相当 CPU batch=1）</text>
+  <circle cx="216" cy="67" r="4.5" fill="#d4a72c"/>
+  <text x="225" y="71" class="sans legend">従来（本家相当 GPU batch=1）</text>
+  <circle cx="406" cy="67" r="4.5" fill="#0969da"/>
+  <text x="415" y="71" class="sans legend">本フォーク（動的バッチ + 3段並列）</text>
+  <circle cx="626" cy="67" r="4.5" fill="#1a7f37"/>
+  <text x="635" y="71" class="sans legend">本フォーク最速（batch=32）</text>
+
+  <!-- Left Card -->
+  <rect x="20" y="84" width="412" height="314" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="38" y="108" class="sans card-title">一括 12ページ処理（モデル初期化込み）</text>
+  <text x="38" y="124" class="sans card-sub">ocr.process 合計時間 · 短いほど高速</text>
+
+  <!-- Left Card Rows (max = 28.108s -> 376px) -->
+  <text x="38" y="150" class="sans row-label">従来（本家相当: CPU batch=1）</text>
+  <text x="414" y="150" text-anchor="end" class="sans row-val">23.19秒 (1.0x)</text>
+  <rect x="38" y="157" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="38" y="157" width="310" height="10" rx="5" fill="#8c959f"/>
+
+  <text x="38" y="190" class="sans row-label">従来（本家相当: GPU batch=1）</text>
+  <text x="414" y="190" text-anchor="end" class="sans row-val">28.11秒 (0.8x)</text>
+  <rect x="38" y="197" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="38" y="197" width="376" height="10" rx="5" fill="#d4a72c"/>
+
+  <text x="38" y="230" class="sans row-label-bold">本フォーク（動的 batch=8 + 並列）</text>
+  <text x="414" y="230" text-anchor="end" class="sans row-val">13.28秒 (1.7x)</text>
+  <rect x="38" y="237" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="38" y="237" width="178" height="10" rx="5" fill="#0969da"/>
+
+  <text x="38" y="270" class="sans row-label-bold">本フォーク（動的 batch=16 + 並列）</text>
+  <text x="414" y="270" text-anchor="end" class="sans row-val">12.17秒 (1.9x)</text>
+  <rect x="38" y="277" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="38" y="277" width="163" height="10" rx="5" fill="#0969da"/>
+
+  <text x="38" y="310" class="sans row-label-bold">本フォーク（動的 batch=32 + 並列）</text>
+  <text x="414" y="310" text-anchor="end" class="sans row-val-best">12.06秒 (1.9x · 最速)</text>
+  <rect x="38" y="317" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="38" y="317" width="161" height="10" rx="5" fill="#1a7f37"/>
+
+  <!-- Left Summary Pill -->
+  <rect x="38" y="352" width="376" height="28" rx="6" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="226" y="370" text-anchor="middle" class="sans pill-text-info">WSL2 Ubuntu ではさらに高速: 8.95秒 (b=16) / 8.34秒 (CUDA12 b=32)</text>
+
+  <!-- Right Card -->
+  <rect x="448" y="84" width="412" height="314" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="466" y="108" class="sans card-title">定常推論 12ページ（連続処理・初期化除く）</text>
+  <text x="466" y="124" class="sans card-sub">処理時間 · 速度 · VRAM 増分 · 短いほど高速</text>
+
+  <!-- Right Card Rows (max = 16.563s -> 376px) -->
+  <text x="466" y="150" class="sans row-label">従来（CPU batch=1）</text>
+  <text x="842" y="150" text-anchor="end" class="sans row-val">11.96秒 · 1.00 p/s</text>
+  <rect x="466" y="157" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="466" y="157" width="272" height="10" rx="5" fill="#8c959f"/>
+
+  <text x="466" y="190" class="sans row-label">従来（GPU batch=1）</text>
+  <text x="842" y="190" text-anchor="end" class="sans row-val">16.56秒 · 0.72 p/s · +988 MiB</text>
+  <rect x="466" y="197" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="466" y="197" width="376" height="10" rx="5" fill="#d4a72c"/>
+
+  <text x="466" y="230" class="sans row-label-bold">本フォーク（動的 batch=8）</text>
+  <text x="842" y="230" text-anchor="end" class="sans row-val">3.89秒 · 3.08 p/s · +1,037 MiB</text>
+  <rect x="466" y="237" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="466" y="237" width="88" height="10" rx="5" fill="#0969da"/>
+
+  <text x="466" y="270" class="sans row-label-bold">本フォーク（動的 batch=16）</text>
+  <text x="842" y="270" text-anchor="end" class="sans row-val">2.88秒 · 4.17 p/s · +1,153 MiB</text>
+  <rect x="466" y="277" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="466" y="277" width="65" height="10" rx="5" fill="#0969da"/>
+
+  <text x="466" y="310" class="sans row-label-bold">本フォーク（動的 batch=32）</text>
+  <text x="842" y="310" text-anchor="end" class="sans row-val-best">2.54秒 · 4.73 p/s · +1,547 MiB</text>
+  <rect x="466" y="317" width="376" height="10" rx="5" fill="#eaeef2"/>
+  <rect x="466" y="317" width="58" height="10" rx="5" fill="#1a7f37"/>
+
+  <!-- Right Summary Pill -->
+  <rect x="466" y="352" width="376" height="28" rx="6" fill="#dafbe1" stroke="#aceebb"/>
+  <text x="654" y="370" text-anchor="middle" class="sans pill-text">高速化: 従来 CPU 比 4.71x · 従来 GPU (b=1) 比 6.53x · 差分 0</text>
+
+  <!-- Footer -->
+  <text x="20" y="420" class="sans footer">従来（本家相当）の GPU batch=1 は高速なデスクトップ CPU 環境ではカーネル起動遅延等により CPU より遅くなる場面があります。</text>
+  <text x="20" y="435" class="sans footer">本フォークは PARSeq 動的バッチ化と 3段パイプライン並列化により、FP32 出力完全一致を保ったまま大幅な高速化を実現しています。</text>
+</svg>
