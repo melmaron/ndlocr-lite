@@ -156,7 +156,10 @@ jobs:
 
       - name: "Upload Release"
         if: github.event_name == 'push' || inputs.create_release
-        run: gh release upload "$RELEASE_TAG" "${BINARY_NAME}" --clobber
+        # NOTE: use the env context instead of shell variables so this also
+        # works on Windows, where the default shell is PowerShell and
+        # `$NAME` does not read environment variables (empty -> gh glob error).
+        run: gh release upload "${{ env.RELEASE_TAG }}" "${{ env.BINARY_NAME }}" --clobber
 
   publish-release:
     needs: [create-release, cross-build]
