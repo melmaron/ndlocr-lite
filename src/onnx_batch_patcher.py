@@ -394,6 +394,8 @@ def verify_dynamic_batch_equivalence(
     """Verify patched dynamic-batch ONNX matches original batch=1 outputs and argmax."""
     opt_orig = ort.SessionOptions()
     opt_patched = ort.SessionOptions()
+    # Dynamic-batch unrolled decoders trigger O(N^2) reuse planning in ORT; disable for patched model.
+    opt_patched.enable_mem_reuse = False
     if disable_ort_optimizations:
         opt_orig.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         opt_patched.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL

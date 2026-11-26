@@ -130,20 +130,23 @@ python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --stric
 - **Plugin EP 構成 (`requirements-gpu-generic.txt`: ORT `1.31.1` + `onnxruntime-ep-webgpu==0.6.0` + `onnxruntime-ep-openvino==1.8.1`)**:
   - 両プラグインが正常登録され、OpenVINO CPU-only 環境（Intel GPU 未検出時）で誤選択せず `--device auto` が正しく `webgpu`（または `cpu`）へフォールバック・優先選択することを確認。
   - Linux Vulkan GPU 上の `WebGpuExecutionProvider` で DEIMv2、動的バッチ PARSeq（`batch=4`, `CPU batch=1` と出力一致）、TableCenterNet v3（`DeformConv`）がいずれも CPU フォールバックなしで動作することを確認。
-- **Google Colab T4 Standard (`Tesla T4 15360 MiB`, NVIDIA driver `580.82.07`, `Python 3.13.16`, `onnxruntime-gpu==1.31.1`, commit `8dbf27b`)**:
-  - `scripts/colab_verify_gpu.py --pages 12` を実行。`CUDAExecutionProvider` が有効化され、両方のセッションで CPU フォールバックが発生しないことを確認。
-  - 公式 PARSeq 3モデル（`24x256-30` / `24x384-50` / `24x768-100`）の CUDA 動的バッチ推論（batch=32）が、CPU `batch=1` の認識結果と完全一致（`exact_match: true`）。
-  - 同梱 `resource/` の 5 画像について、`--enable-tcy` の off / on の双方で CUDA batch=32 の TXT・XML `LINE STRING`・JSON のテキストと座標が CPU `batch=1` と完全一致。
-  - TableCenterNet v3（`DeformConv`）を CUDA で推論し、CPU と同一セル数（合成表 3 セル）・CPU フォールバックなしを確認。
-  - 12 ページ（同梱 `resource/` 画像の繰り返し、各モードのモデル初期化時間を含む）の一括処理実測:
+- **Google Colab T4 Standard (`Tesla T4 15360 MiB`, NVIDIA driver `580.82.07`, `Python 3.13.16`, `onnxruntime-gpu==1.31.1`)**:
+  - 動的バッチ版 PARSeq のセッション初期化で `allocation_planner` が展開済みデコーダの動的テンソル再利用計画に約 45 秒以上を費やしていたボトルネックを解消（`parseq.py` / `ort_provider.py` で `dynamic_batch=True` 時のみ `enable_mem_reuse=False`、CUDA に `cudnn_conv_algo_search="HEURISTIC"` を適用）。
+  - 同梱 `resource/` の 5 画像（計 225 行）について、`--enable-tcy` の off / on 双方で CUDA 動的バッチ (`batch=32`) と `CPU batch=1` の TXT・XML `LINE STRING`・JSON (`contents`) が完全一致（差分 0）。12 ページ一括でも `CPU batch=1` / `CUDA batch=1` / `CUDA batch=8, 16, 32` 間で出力差分 0 を確認。
+  - TableCenterNet v3（`DeformConv`）を CUDA で推論し、`CUDAExecutionProvider` 有効・CPU フォールバックなし・CPU と同一セル数（合成表 3 セル）を確認。
+  - 12 ページ（同梱 `resource/` 画像の繰り返し）の一括処理 (`ocr.process`・モデル初期化込み) および独立プロセスでの定常推論（初期化・1 ページウォームアップ除外）・プロセス VRAM 実測:
 
-    | モード | 処理時間 (秒) | pages/sec | CPU batch=1 比 |
-    |---|---|---|---|
-    | CPU `batch=1` | 86.401 | 0.139 | 1.00x |
-    | CUDA `batch=1` | 23.802 | 0.504 | 3.63x |
-    | CUDA 動的バッチ32 + 3段パイプライン | 60.364 | 0.199 | 1.43x |
+    | モード | 一括 12p (秒, 初期化込) | 一括 pages/sec | 定常 12p (秒, 初期化除) | 定常 pages/sec | プロセス VRAM |
+    |---|---|---|---|---|---|
+    | CPU `batch=1` | 91.245 | 0.132 | 79.967 (`*`) | 0.150 | — |
+    | CUDA `batch=1` | 23.683 | 0.507 | 12.598 | 0.953 | 882 MiB |
+    | CUDA 動的バッチ `8` + 3段パイプライン | 14.671 | 0.818 | 4.294 | 2.795 | 1,008 MiB |
+    | CUDA 動的バッチ `16` + 3段パイプライン | 14.477 | 0.829 | 3.966 | 3.026 | 1,142 MiB |
+    | CUDA 動的バッチ `32` + 3段パイプライン | 14.595 | 0.822 | 3.876 | 3.096 | 1,524 MiB |
 
-    この 12 ページ構成では CUDA `--batch-size 1` が最速で、動的バッチ32は CUDA `batch=1` の 0.39 倍（= 遅い）。動的バッチは出力一致を保ったまま利用できますが、T4 の小規模バッチでは効果が限定的なため、`--batch-size` は実測して選択してください（CPU 環境では `batch=1` のスレッド並列経路が有効です）。
+    `*` CPU `batch=1` の初期化除き時間は `ocr.process` 内 12 ページの処理時間合計（モデル初期化時間 11.369 秒、内訳 DET 2.083 秒 + PARSeq 3 モデル 9.287 秒は独立計測）。CUDA 動的バッチの初期化は `batch=8/16/32` で `9.838〜10.242` 秒（`batch=1` の `11.165` 秒より高速）。
+
+    最適化前は T4 上で CUDA 動的バッチ `32` の一括 12 ページが 60.364 秒かかっていましたが、最適化後は **14.595 秒（4.14x 高速化・CPU 比 6.25x・CUDA `batch=1` 比 1.62x）** へ改善しました。初期化を除く定常 12 ページ推論では **`batch=32` が 3.876 秒（`3.096 pages/sec`、CUDA `batch=1` 比 3.25x・CPU 比約 20.6x）** に達します。また `--batch-size 16` は定常速度の約 98%（`3.026 pages/sec`）・12p 合計 `14.477` 秒を保ったまま VRAM を `382 MiB` 削減できるため、VRAM 容量に制約のある GPU（4 GB 級など）では `--batch-size 16` も有効です。
 
 お使いの CUDA 環境または Google Colab で 12 ページ連続ベンチマークおよび 5 画像フル OCR 一致検査を実行する場合は、以下を実行してください:
 

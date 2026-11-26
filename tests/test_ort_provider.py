@@ -237,6 +237,36 @@ class OrtProviderTest(unittest.TestCase):
         self.assertIn("TableCenterNet (DeformConv, ORT>=1.25):", report)
         self.assertIn("Selected by '--device auto':", report)
 
+    def test_cuda_session_options_use_heuristic_and_forward_mem_reuse(self):
+        captured = {}
+
+        class _FakeSess:
+            def __init__(self, path, sess_options=None, providers=None):
+                captured["path"] = path
+                captured["opt"] = sess_options
+                captured["providers"] = providers
+
+            def get_providers(self):
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        with patch.object(ort_provider, "preload_cuda_dlls_if_needed"), patch.object(
+            ort_provider.ort,
+            "get_available_providers",
+            return_value=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        ), patch.object(ort_provider.ort, "InferenceSession", side_effect=_FakeSess):
+            _, profile = ort_provider.create_inference_session(
+                "model.onnx",
+                device="cuda",
+                device_id=1,
+                enable_mem_reuse=False,
+            )
+        self.assertEqual(profile.active_backend, "cuda")
+        self.assertFalse(captured["opt"].enable_mem_reuse)
+        self.assertEqual(
+            captured["providers"][0],
+            ("CUDAExecutionProvider", {"device_id": 1, "cudnn_conv_algo_search": "HEURISTIC"}),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

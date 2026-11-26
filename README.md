@@ -164,10 +164,10 @@ ndlocr-lite gui
 
 現在の検証状況は以下の通りです（詳細・最新条件は [`docs/GPU_SETUP.md`](./docs/GPU_SETUP.md) 第 5 節参照）:
 
-- **自動テストスイート (`pytest tests ndlocr-lite-gui/tests`)**: 全 93 テスト（+ 51 サブテスト）合格。公式 PARSeq 3 モデルの動的バッチ変換における `B=1` 厳密一致（誤差 `<= 1e-5`）・バッチ時 `argmax` 完全一致、および 3 段パイプラインの XML / JSON / TXT 完全一致を検証済み。
+- **自動テストスイート (`pytest tests ndlocr-lite-gui/tests`)**: 全 95 テスト（+ 51 サブテスト）合格。公式 PARSeq 3 モデルの動的バッチ変換における `B=1` 厳密一致（誤差 `<= 1e-5`）・バッチ時 `argmax` 完全一致、および 3 段パイプラインの XML / JSON / TXT 完全一致を検証済み。
 - **GitHub Actions CI**: `ubuntu-latest` / `windows-latest` × Python `3.11` / `3.12` の全 4 ジョブ合格、および `build-flet-cross` による 6 ターゲット（Windows/Linux × GPU Generic/CUDA、macOS Apple Silicon/Intel）の Flet ビルド成功を確認済み。
 - **Plugin EP 構成**: 隔離仮想環境（ORT `1.31.1` + WebGPU `0.6.0` + OpenVINO `1.8.1`）で WebGPU 実機推論（DEIMv2・PARSeq 動的バッチ・TableCenterNet v3）および OpenVINO CPU-only 誤選択防止を確認済み。
-- **Google Colab T4 Standard 実測 (`Tesla T4 15360 MiB`, `onnxruntime-gpu==1.31.1`)**: 同梱 5 画像のフル OCR（`--enable-tcy` off/on）と PARSeq 3 モデル CUDA 動的バッチ推論が CPU `batch=1` と完全一致。12 ページ（モデル初期化込み）の処理時間は CPU `batch=1` 86.4 秒 / CUDA `batch=1` 23.8 秒 / CUDA 動的バッチ32 + 3段パイプライン 60.4 秒。T4 の小規模バッチでは `--batch-size 1` が最速（条件の詳細は [GPU セットアップガイド](./docs/GPU_SETUP.md) 第 5 節）。
+- **Google Colab T4 Standard 実測 (`Tesla T4 15360 MiB`, `onnxruntime-gpu==1.31.1`)**: 同梱 5 画像（225 行、`--enable-tcy` off/on）および 12 ページ一括で CPU `batch=1` と完全一致（TXT / XML / JSON 差分 0）。12 ページ（モデル初期化込み）の処理時間は CPU `batch=1` 91.2 秒 / CUDA `batch=1` 23.7 秒 / CUDA 動的バッチ `16`・`32` + 3段パイプライン 14.5〜14.6 秒（初期化除外の定常推論では `batch=32` が 3.9 秒・CUDA `batch=1` 比 3.25x / CPU 比約 20.6x、`--batch-size 16` は VRAM 382 MiB 省メモリで 4.0 秒。条件の詳細は [GPU セットアップガイド](./docs/GPU_SETUP.md) 第 5 節）。
 
 お使いの CUDA 環境または Google Colab で 12 ページ連続ベンチマークおよび 5 画像フル OCR 一致検査（`--enable-tcy` 有無含む）を実行する場合は、以下を実行してください:
 

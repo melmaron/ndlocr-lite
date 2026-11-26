@@ -146,11 +146,31 @@ class GuiGpuConfigTest(unittest.TestCase):
             self.assertIsNotNone(warning)
             self.assertEqual(cfg["langcode"], "ja")
 
+            path.write_text("langcode: en\ndevice: cuda\n", encoding="utf-8")
+            cfg, warning = self.app.load_user_config(path, defaults)
+            self.assertIsNone(warning)
+            self.assertEqual(cfg["langcode"], "en")
+            self.assertEqual(cfg["device"], "cuda")
+
             path.write_text("langcode: fr\ndevice: cuda\n", encoding="utf-8")
             cfg, warning = self.app.load_user_config(path, defaults)
             self.assertIsNone(warning)
             self.assertEqual(cfg["langcode"], "ja")  # unsupported locale falls back
             self.assertEqual(cfg["device"], "cuda")
+
+    def test_busy_tracker_fires_on_idle_only_when_outermost_task_finishes(self):
+        events = []
+        tracker = self.app.BusyTracker(on_idle=lambda: events.append("idle"))
+        tracker.leave()  # 0 -> 0 must not trigger idle callback
+        self.assertEqual(events, [])
+        tracker.enter()
+        tracker.enter()
+        tracker.leave()  # 2 -> 1 still active
+        self.assertTrue(tracker.active)
+        self.assertEqual(events, [])
+        tracker.leave()  # 1 -> 0 fires once
+        self.assertFalse(tracker.active)
+        self.assertEqual(events, ["idle"])
 
     def test_save_user_config_is_atomic_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmpdir:

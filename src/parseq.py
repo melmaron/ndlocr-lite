@@ -70,6 +70,8 @@ class PARSEQ:
             device_id=self.device_id,
             strict_device=self.strict_device,
             cpu_single_thread=True,
+            # Dynamic-batch unrolled decoders trigger O(N^2) reuse planning in ORT (~35s on rec100).
+            enable_mem_reuse=not self.dynamic_batch,
             model_label=f"PARSEQ({Path(self.model_path).name})",
         )
         self.session = session

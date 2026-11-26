@@ -662,11 +662,11 @@ class ImageSelector:
             self.result_plain_text.value = f'エラーが発生しました: {ex}'
             self.resulttext.value = f'エラーが発生しました: {ex}'
         finally:
-            if self.busy_tracker is not None:
-                self.busy_tracker.leave()
             self.cropocr_btn.disabled = False
             self.open_result_page()
             self.page.update()
+            if self.busy_tracker is not None:
+                self.busy_tracker.leave()
 
     def close_dialog(self, e):
         if self.dialog.open:
@@ -1005,10 +1005,10 @@ class CaptureTool:
             self.resulttext.value = f'エラーが発生しました: {e}'
             self.open_result_page()
         finally:
-            if self.busy_tracker is not None:
-                self.busy_tracker.leave()
             self.ocr_btn.disabled = False
             self.page.update()
+            if self.busy_tracker is not None:
+                self.busy_tracker.leave()
 
     def open_dialog(self, e=None):
         self.start_capture()
@@ -1103,14 +1103,21 @@ def format_gui_engine_status(detector, recognizer, langcode='ja'):
 class BusyTracker:
     """Track long-running OCR work so UI/engine changes can be deferred."""
 
-    def __init__(self):
+    def __init__(self, on_idle=None):
         self._active = 0
+        self._on_idle = on_idle
+
+    def set_on_idle(self, callback):
+        self._on_idle = callback
 
     def enter(self):
         self._active += 1
 
     def leave(self):
+        was_active = self._active > 0
         self._active = max(0, self._active - 1)
+        if was_active and self._active == 0 and self._on_idle is not None:
+            self._on_idle()
 
     @property
     def active(self):
@@ -1134,7 +1141,8 @@ def load_user_config(path, defaults):
                 merged.update(loaded)
     except Exception as exc:
         warning = f'failed to load user config: {exc}'
-    if merged.get('langcode') not in TRANSLATIONS:
+    supported_locales = set(next(iter(TRANSLATIONS.values()), {'ja': '', 'en': ''}).keys())
+    if merged.get('langcode') not in supported_locales:
         merged['langcode'] = 'ja'
     return merged, warning
 
@@ -1434,6 +1442,17 @@ def main(page: ft.Page, args=None, download_models=False):
                 set_progress_message('Reloading OCR models…')
             page.update()
             page.run_task(initialize_models)
+
+        def _flush_pending_engine_reload():
+            if (
+                pending_engine_reload['pending']
+                and not busy_tracker.active
+                and not model_state['loading']
+            ):
+                pending_engine_reload['pending'] = False
+                start_engine_reload()
+
+        busy_tracker.set_on_idle(_flush_pending_engine_reload)
 
         async def process_pdf_with_original_layer(pdf_path: str, outputpath: str, alljsonobjlist: list, pdf_outpath_list: list, allsum: int):
             pdf_path_obj = Path(pdf_path)
@@ -1913,12 +1932,9 @@ def main(page: ft.Page, args=None, download_models=False):
                 progressmessage.update()
             finally:
                 ocr_cancel_event.clear()
-                busy_tracker.leave()
                 parts_control(False)
                 page.update()
-                if pending_engine_reload['pending'] and not busy_tracker.active:
-                    pending_engine_reload['pending'] = False
-                    start_engine_reload()
+                busy_tracker.leave()
 
         async def pick_files_result(e):
             files = await file_picker.pick_files(allow_multiple=False)

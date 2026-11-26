@@ -319,9 +319,13 @@ def detect_available_backends() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def _build_session_options(cpu_single_thread: bool = False) -> ort.SessionOptions:
+def _build_session_options(
+    cpu_single_thread: bool = False,
+    enable_mem_reuse: bool = True,
+) -> ort.SessionOptions:
     opt = ort.SessionOptions()
     opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opt.enable_mem_reuse = bool(enable_mem_reuse)
     if cpu_single_thread:
         opt.intra_op_num_threads = 1
         opt.inter_op_num_threads = 1
@@ -358,6 +362,7 @@ def _create_session_for_backend(
     *,
     device_id: int,
     cpu_single_thread: bool,
+    enable_mem_reuse: bool = True,
 ) -> Tuple[ort.InferenceSession, List[str]]:
     model_str = str(model_path)
     register_plugin_eps()
@@ -365,7 +370,10 @@ def _create_session_for_backend(
     ep_devices = _safe_ep_devices()
 
     if backend == "cpu":
-        opt = _build_session_options(cpu_single_thread=cpu_single_thread)
+        opt = _build_session_options(
+            cpu_single_thread=cpu_single_thread,
+            enable_mem_reuse=enable_mem_reuse,
+        )
         session = ort.InferenceSession(model_str, opt, providers=["CPUExecutionProvider"])
         return session, list(session.get_providers())
 
@@ -373,8 +381,17 @@ def _create_session_for_backend(
         preload_cuda_dlls_if_needed()
         if "CUDAExecutionProvider" not in available_providers:
             raise RuntimeError("CUDAExecutionProvider is not available in installed onnxruntime.")
-        opt = _build_session_options(cpu_single_thread=False)
-        providers = [("CUDAExecutionProvider", {"device_id": int(device_id)}), "CPUExecutionProvider"]
+        opt = _build_session_options(
+            cpu_single_thread=False,
+            enable_mem_reuse=enable_mem_reuse,
+        )
+        providers = [
+            (
+                "CUDAExecutionProvider",
+                {"device_id": int(device_id), "cudnn_conv_algo_search": "HEURISTIC"},
+            ),
+            "CPUExecutionProvider",
+        ]
         session = ort.InferenceSession(model_str, opt, providers=providers)
         active = list(session.get_providers())
         if "CUDAExecutionProvider" not in active:
@@ -384,7 +401,10 @@ def _create_session_for_backend(
     if backend == "migraphx":
         if "MIGraphXExecutionProvider" not in available_providers:
             raise RuntimeError("MIGraphXExecutionProvider is not available.")
-        opt = _build_session_options(cpu_single_thread=False)
+        opt = _build_session_options(
+            cpu_single_thread=False,
+            enable_mem_reuse=enable_mem_reuse,
+        )
         providers = [("MIGraphXExecutionProvider", {"device_id": int(device_id)}), "CPUExecutionProvider"]
         session = ort.InferenceSession(model_str, opt, providers=providers)
         active = list(session.get_providers())
@@ -395,7 +415,10 @@ def _create_session_for_backend(
     if backend == "rocm":
         if "ROCMExecutionProvider" not in available_providers:
             raise RuntimeError("ROCMExecutionProvider is not available.")
-        opt = _build_session_options(cpu_single_thread=False)
+        opt = _build_session_options(
+            cpu_single_thread=False,
+            enable_mem_reuse=enable_mem_reuse,
+        )
         providers = [("ROCMExecutionProvider", {"device_id": int(device_id)}), "CPUExecutionProvider"]
         session = ort.InferenceSession(model_str, opt, providers=providers)
         active = list(session.get_providers())
@@ -412,7 +435,10 @@ def _create_session_for_backend(
                     f"({len(gpu_devs)} GPU device(s) detected)."
                 )
             chosen = gpu_devs[device_id]
-            opt = _build_session_options(cpu_single_thread=False)
+            opt = _build_session_options(
+                cpu_single_thread=False,
+                enable_mem_reuse=enable_mem_reuse,
+            )
             opt.add_provider_for_devices([chosen], {})
             session = ort.InferenceSession(model_str, sess_options=opt)
             active = list(session.get_providers())
@@ -422,7 +448,10 @@ def _create_session_for_backend(
         if "openvino_ep" in _REGISTERED_PLUGINS:
             raise RuntimeError("OpenVINO plugin loaded, but no Intel GPU device detected (CPU/NPU only).")
         if "OpenVINOExecutionProvider" in available_providers:
-            opt = _build_session_options(cpu_single_thread=False)
+            opt = _build_session_options(
+                cpu_single_thread=False,
+                enable_mem_reuse=enable_mem_reuse,
+            )
             ov_device = "GPU" if int(device_id) == 0 else f"GPU.{int(device_id)}"
             providers = [("OpenVINOExecutionProvider", {"device_type": ov_device}), "CPUExecutionProvider"]
             session = ort.InferenceSession(model_str, opt, providers=providers)
@@ -442,7 +471,10 @@ def _create_session_for_backend(
                 )
             chosen = webgpu_devs[device_id]
             ep_name = str(chosen.ep_name)
-            opt = _build_session_options(cpu_single_thread=False)
+            opt = _build_session_options(
+                cpu_single_thread=False,
+                enable_mem_reuse=enable_mem_reuse,
+            )
             opt.add_provider_for_devices([chosen], {})
             session = ort.InferenceSession(model_str, sess_options=opt)
             active = list(session.get_providers())
@@ -452,7 +484,10 @@ def _create_session_for_backend(
         if "webgpu" in _REGISTERED_PLUGINS:
             raise RuntimeError("WebGPU plugin loaded, but no compatible GPU adapter detected.")
         if "WebGpuExecutionProvider" in available_providers:
-            opt = _build_session_options(cpu_single_thread=False)
+            opt = _build_session_options(
+                cpu_single_thread=False,
+                enable_mem_reuse=enable_mem_reuse,
+            )
             providers = [("WebGpuExecutionProvider", {"deviceId": int(device_id)}), "CPUExecutionProvider"]
             session = ort.InferenceSession(model_str, opt, providers=providers)
             active = list(session.get_providers())
@@ -464,7 +499,10 @@ def _create_session_for_backend(
     if backend == "dml":
         if "DmlExecutionProvider" not in available_providers:
             raise RuntimeError("DmlExecutionProvider is not available.")
-        opt = _build_session_options(cpu_single_thread=False)
+        opt = _build_session_options(
+            cpu_single_thread=False,
+            enable_mem_reuse=enable_mem_reuse,
+        )
         opt.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         opt.enable_mem_pattern = False
         providers = [("DmlExecutionProvider", {"device_id": int(device_id)}), "CPUExecutionProvider"]
@@ -509,6 +547,7 @@ def create_inference_session(
     device_id: int = 0,
     strict_device: bool = False,
     cpu_single_thread: bool = False,
+    enable_mem_reuse: bool = True,
     model_label: str = "model",
 ) -> Tuple[ort.InferenceSession, BackendProfile]:
     """Create an ONNX Runtime InferenceSession for the requested device or 'auto'."""
@@ -538,6 +577,7 @@ def create_inference_session(
                     candidate,
                     device_id=device_id,
                     cpu_single_thread=cpu_single_thread,
+                    enable_mem_reuse=enable_mem_reuse,
                 )
                 return session, _make_profile(
                     requested_device="auto",
@@ -559,6 +599,7 @@ def create_inference_session(
             "cpu",
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
+            enable_mem_reuse=enable_mem_reuse,
         )
         warning_msg = None
         if failures:
@@ -582,6 +623,7 @@ def create_inference_session(
             "cpu",
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
+            enable_mem_reuse=enable_mem_reuse,
         )
         return session, _make_profile(
             requested_device="cpu",
@@ -597,6 +639,7 @@ def create_inference_session(
             requested,
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
+            enable_mem_reuse=enable_mem_reuse,
         )
         if requested == "dml" and not ort_supports_deform_conv() and "table" in model_label.casefold():
             _emit_warning_once(
@@ -622,6 +665,7 @@ def create_inference_session(
             "cpu",
             device_id=device_id,
             cpu_single_thread=cpu_single_thread,
+            enable_mem_reuse=enable_mem_reuse,
         )
         warning_msg = _format_fallback_warning(requested, "cpu", str(exc), model_label)
         _emit_warning_once((requested, "cpu", str(exc)), warning_msg)
