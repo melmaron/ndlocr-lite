@@ -130,9 +130,20 @@ python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --stric
 - **Plugin EP 構成 (`requirements-gpu-generic.txt`: ORT `1.31.1` + `onnxruntime-ep-webgpu==0.6.0` + `onnxruntime-ep-openvino==1.8.1`)**:
   - 両プラグインが正常登録され、OpenVINO CPU-only 環境（Intel GPU 未検出時）で誤選択せず `--device auto` が正しく `webgpu`（または `cpu`）へフォールバック・優先選択することを確認。
   - Linux Vulkan GPU 上の `WebGpuExecutionProvider` で DEIMv2、動的バッチ PARSeq（`batch=4`, `CPU batch=1` と出力一致）、TableCenterNet v3（`DeformConv`）がいずれも CPU フォールバックなしで動作することを確認。
-- **Google Colab T4 Standard (`Tesla T4 15360 MiB`, `CUDA 13.0`, `Python 3.13.16`, `onnxruntime-gpu==1.31.1`)**:
-  - `src/ocr.py --check-device` にて `CUDAExecutionProvider` の有効化、`TableCenterNet (DeformConv, ORT>=1.25): SUPPORTED`、`--device auto` による `cuda` 自動選択を確認。
-  - 公式 PARSeq 3モデルの動的バッチキャッシュ生成と検証 (`_dynbatch_fp32_v1.onnx`) を確認。
+- **Google Colab T4 Standard (`Tesla T4 15360 MiB`, NVIDIA driver `580.82.07`, `Python 3.13.16`, `onnxruntime-gpu==1.31.1`, commit `8dbf27b`)**:
+  - `scripts/colab_verify_gpu.py --pages 12` を実行。`CUDAExecutionProvider` が有効化され、両方のセッションで CPU フォールバックが発生しないことを確認。
+  - 公式 PARSeq 3モデル（`24x256-30` / `24x384-50` / `24x768-100`）の CUDA 動的バッチ推論（batch=32）が、CPU `batch=1` の認識結果と完全一致（`exact_match: true`）。
+  - 同梱 `resource/` の 5 画像について、`--enable-tcy` の off / on の双方で CUDA batch=32 の TXT・XML `LINE STRING`・JSON のテキストと座標が CPU `batch=1` と完全一致。
+  - TableCenterNet v3（`DeformConv`）を CUDA で推論し、CPU と同一セル数（合成表 3 セル）・CPU フォールバックなしを確認。
+  - 12 ページ（同梱 `resource/` 画像の繰り返し、各モードのモデル初期化時間を含む）の一括処理実測:
+
+    | モード | 処理時間 (秒) | pages/sec | CPU batch=1 比 |
+    |---|---|---|---|
+    | CPU `batch=1` | 86.401 | 0.139 | 1.00x |
+    | CUDA `batch=1` | 23.802 | 0.504 | 3.63x |
+    | CUDA 動的バッチ32 + 3段パイプライン | 60.364 | 0.199 | 1.43x |
+
+    この 12 ページ構成では CUDA `--batch-size 1` が最速で、動的バッチ32は CUDA `batch=1` の 0.39 倍（= 遅い）。動的バッチは出力一致を保ったまま利用できますが、T4 の小規模バッチでは効果が限定的なため、`--batch-size` は実測して選択してください（CPU 環境では `batch=1` のスレッド並列経路が有効です）。
 
 お使いの CUDA 環境または Google Colab で 12 ページ連続ベンチマークおよび 5 画像フル OCR 一致検査を実行する場合は、以下を実行してください:
 
