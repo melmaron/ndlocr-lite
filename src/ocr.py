@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
 import time
+import math
 import shutil
 import json
 import glob
@@ -1571,6 +1572,19 @@ def _write_image_outputs(
             wtf.write("\n".join(alltextlist))
 
 
+def _sanitize_pdf_render_dpi(value, default: float = 150.0, minimum: float = 1.0) -> float:
+    """Return a finite positive PDF render DPI, falling back to default otherwise."""
+    if isinstance(value, bool):
+        return float(default)
+    try:
+        dpi = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(dpi) or dpi <= 0:
+        return float(default)
+    return max(float(minimum), dpi)
+
+
 def process_pdf_documents(args, pdf_paths: list[str]):
     try:
         import pypdfium2
@@ -1602,7 +1616,7 @@ def process_pdf_documents(args, pdf_paths: list[str]):
     recognizer30 = get_recognizer(args=args, weights_path=args.rec_weights30)
     recognizer50 = get_recognizer(args=args, weights_path=args.rec_weights50)
 
-    render_dpi = max(float(getattr(args, "pdf_render_dpi", 150)), 1.0)
+    render_dpi = _sanitize_pdf_render_dpi(getattr(args, "pdf_render_dpi", 150.0))
     render_scale = render_dpi / 72.0
 
     for pdf_path in pdf_paths:
@@ -1713,7 +1727,7 @@ def process_pdf_documents(args, pdf_paths: list[str]):
                         "pdf_path": str(pdf_path_obj),
                         "pdf_name": pdf_path_obj.name,
                         "page_count": len(page_results),
-                        "render_dpi": float(getattr(args, "pdf_render_dpi", 150)),
+                        "render_dpi": render_dpi,
                     },
                     "pages": page_infos,
                 }
@@ -1935,6 +1949,16 @@ def main(download_models=False):
             application_version = version("ndlocr-lite")
         except PackageNotFoundError:
             pass
+
+    def _parse_pdf_render_dpi_arg(value: str) -> float:
+        try:
+            dpi = float(value)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"invalid DPI value: {value!r}") from exc
+        if not math.isfinite(dpi) or dpi <= 0:
+            raise argparse.ArgumentTypeError(f"DPI must be a finite positive number, got {value!r}")
+        return dpi
+
     base_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Arguments for NDLkotenOCR-Lite")
     if download_models:
@@ -1946,7 +1970,7 @@ def main(download_models=False):
     parser.add_argument("--output", type=str, required=False, help="Path to output directory")
     parser.add_argument("--viz", type=bool, required=False, help="Save visualized image",default=False)
     parser.add_argument("--pdf-output", type=str, required=False, help="Path to output text-layer PDF")
-    parser.add_argument("--pdf-render-dpi", "--pdf-dpi", dest="pdf_render_dpi", type=float, required=False, default=150.0, help="DPI used to render PDF pages for OCR")
+    parser.add_argument("--pdf-render-dpi", "--pdf-dpi", dest="pdf_render_dpi", type=_parse_pdf_render_dpi_arg, required=False, default=150.0, help="DPI used to render PDF pages for OCR")
     parser.add_argument("--pdf-page-output", action=argparse.BooleanOptionalAction, default=True, help="When a multi-page PDF is input, output TXT/JSON/XML per page")
     parser.add_argument("--pdf-visible-text", action="store_true", help="Draw PDF text layer visibly in blue for debugging")
     parser.add_argument("--det-weights", type=str, required=False, help="Path to deim onnx file", default=str(base_dir / "model" / "deim-s-1024x1024-261124.onnx"))

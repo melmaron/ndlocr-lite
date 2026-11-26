@@ -196,6 +196,22 @@ class CliArgumentsTest(unittest.TestCase):
         self.assertIn("download failed", stderr.getvalue())
         process.assert_not_called()
 
+    def test_pdf_render_dpi_rejects_non_finite_and_non_positive_values(self):
+        for flag in ("--pdf-render-dpi", "--pdf-dpi"):
+            for bad in ("inf", "-inf", "nan", "1e999", "0", "-10", "abc"):
+                with self.subTest(flag=flag, bad=bad), contextlib.redirect_stderr(io.StringIO()):
+                    argv = ["ocr.py", "--sourcepdf", "doc.pdf", "--output", "output", flag, bad]
+                    with patch.object(sys, "argv", argv), patch.object(ocr, "process") as process:
+                        with self.assertRaises(SystemExit) as error:
+                            ocr.main()
+                    self.assertEqual(error.exception.code, 2)
+                    process.assert_not_called()
+
+        for flag, raw, expected in (("--pdf-render-dpi", "200", 200.0), ("--pdf-dpi", "120", 120.0)):
+            with self.subTest(flag=flag, raw=raw):
+                args = self.parse_cli(flag, raw)
+                self.assertEqual(args.pdf_render_dpi, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

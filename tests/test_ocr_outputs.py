@@ -343,6 +343,40 @@ class PdfRobustnessTest(unittest.TestCase):
                 ocr.process(args)
             self._assert_valid_pdf_outputs(out)
 
+    def test_sanitize_pdf_render_dpi_and_non_finite_programmatic_fallback(self):
+        for raw, expected in [
+            ("inf", 150.0),
+            ("-inf", 150.0),
+            ("nan", 150.0),
+            ("1e999", 150.0),
+            (float("inf"), 150.0),
+            (float("-inf"), 150.0),
+            (float("nan"), 150.0),
+            ("0", 150.0),
+            ("-5", 150.0),
+            (None, 150.0),
+            ("abc", 150.0),
+            (True, 150.0),
+            ("0.5", 1.0),
+            ("200", 200.0),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(ocr._sanitize_pdf_render_dpi(raw), expected)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            valid_pdf = tmp / "doc.pdf"
+            _write_pdf(valid_pdf, pages=1)
+            out = tmp / "out"
+            args = _make_args(out, pdf_render_dpi=float("inf"))
+            with patch.object(ocr, "get_detector", return_value=_StubDetector()), patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ):
+                ocr.process_pdf_documents(args, [str(valid_pdf)])
+            self._assert_valid_pdf_outputs(out)
+            payload = json.loads((out / "doc.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["pdfinfo"]["render_dpi"], 150.0)
+
 
 class XmlFilenameEscapingTest(unittest.TestCase):
     """PAGE@IMAGENAME must stay well-formed for POSIX filenames with <, >, &, "."""
