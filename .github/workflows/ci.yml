@@ -58,6 +58,6 @@ jobs:
       - name: Build package and smoke-test CLI entry point
         run: |
           python -m build --wheel --outdir dist
-          pip install --no-deps --force-reinstall dist/*.whl
+          python -c "import glob, subprocess, sys; whl = glob.glob('dist/*.whl')[0]; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-deps', '--force-reinstall', whl])"
           ndlocr-lite --check-device
           ndlocr-lite --help
