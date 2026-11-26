@@ -3,7 +3,7 @@
 NDLOCR-Liteの使い方を説明します。
 
 ## 起動方法
-お使いのOSに対応する圧縮ファイルを展開し、ndlocr_liteをダブルクリック等で実行してください。
+[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite/releases) から、お使いのOSに対応する圧縮ファイル（Windows: `ndlocr_lite_v*_windows_cuda.zip` / `..._windows_gpu_generic.zip`、Linux: `..._linux_cuda.tar.gz` / `..._linux_gpu_generic.tar.gz`、macOS: `..._macos_apple_silicon.tar.gz` / `..._macos_intel.tar.gz`）をダウンロードし、展開して `ndlocr_lite` をダブルクリック等で実行してください。
 
 なお、セキュリティに関する警告が出ることがあります。
 
@@ -29,7 +29,7 @@ https://zenn.dev/nakamura196/articles/c62a465537ff20
 ## 自分でアプリケーションをビルドする場合の方法（開発者向け情報）
 本アプリケーションは[Flet（外部サイト）](https://flet.dev/)を利用します。
 
-いずれのOSの場合にも事前にFlutter-SDK3.27.4の導入が必要です。依存関係のインストールに関する説明は省略します。
+いずれのOSの場合にも事前にFlutter-SDK 3.47.9の導入が必要です（CI の [`build-flet-cross.yml`](../.github/workflows/build-flet-cross.yml) と同じバージョン）。依存関係のインストールに関する説明は省略します。
 
 ### Windowsの場合
 https://flet.dev/docs/publish/windows/

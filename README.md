@@ -268,7 +268,7 @@ PYTHONPATH=src:ndlocr-lite-gui .venv/bin/pytest tests ndlocr-lite-gui/tests -v
 ```
 
 - **ローカル・実機自動テスト（`Python 3.12.16`）**:
-  - **ローカル Linux（最新）**: **123 passed（+ 103 subtests）**
+  - **ローカル Linux（最新）**: **124 passed（+ 103 subtests）**
   - **実機 Windows 11 / WSL2 Ubuntu（`c0eec1a` 時点）**: Windows 11 **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS で使用不可文字を含む POSIX ファイル名テストをスキップ） / WSL2 Ubuntu **101 passed（+ 67 subtests）**
 - **GitHub Actions CI（[ci.yml](./.github/workflows/ci.yml)）**: 履歴スナップショット（コミット `17222a9`）で全 4 ジョブ通過（`ubuntu-latest` `98 passed (+ 67 subtests)` / `windows-latest` `97 passed, 1 skipped (+ 63 subtests)`）
 - **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: コミット `11d9474` 時点で全 6 ターゲット（Windows `cuda` / `gpu-generic`、Ubuntu `cuda` / `gpu-generic`、macOS Apple Silicon / Intel）のビルド成功を確認済み
