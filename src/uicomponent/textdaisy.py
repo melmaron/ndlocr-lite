@@ -858,16 +858,17 @@ class TextDaisyExporter:
                 "pypdfium2 is required to export DAISY figures from PDF input."
             ) from exc
 
-        pdf_document = pypdfium2.PdfDocument(str(image_path))
-        try:
-            rendered_pages = pdf_document.render(
-                pypdfium2.PdfBitmap.to_pil,
-                page_indices=[int(source_page_index)],
-                scale=self.FIGURE_DPI / 72.0,
-            )
-            return next(iter(rendered_pages)).convert("RGB")
-        finally:
-            pdf_document.close()
+        with Path(image_path).open("rb") as pdf_stream:
+            pdf_document = pypdfium2.PdfDocument(pdf_stream)
+            try:
+                rendered_pages = pdf_document.render(
+                    pypdfium2.PdfBitmap.to_pil,
+                    page_indices=[int(source_page_index)],
+                    scale=self.FIGURE_DPI / 72.0,
+                )
+                return next(iter(rendered_pages)).convert("RGB")
+            finally:
+                pdf_document.close()
 
     def _source_coordinate_scale(self, page: Dict[str, Any]) -> float:
         image_path_value = page.get("image_path")

@@ -1624,11 +1624,12 @@ def process_pdf_documents(args, pdf_paths: list[str]):
         pdf_path_obj = Path(pdf_path)
         output_stem = pdf_path_obj.stem
         try:
-            pdf_doc_meta = pypdfium2.PdfDocument(str(pdf_path_obj))
-            try:
-                page_count = len(pdf_doc_meta)
-            finally:
-                pdf_doc_meta.close()
+            with pdf_path_obj.open("rb") as pdf_stream:
+                pdf_doc_meta = pypdfium2.PdfDocument(pdf_stream)
+                try:
+                    page_count = len(pdf_doc_meta)
+                finally:
+                    pdf_doc_meta.close()
         except (pypdfium2.PdfiumError, OSError, ValueError) as exc:
             print(f"Failed to open PDF: {pdf_path} ({exc})")
             continue
@@ -1646,13 +1647,29 @@ def process_pdf_documents(args, pdf_paths: list[str]):
             getattr(args, "pdf_page_output", True),
         )
 
-        thread_local = threading.local()
+        # Keep both stream and PdfDocument in an explicit state dict rather than passing
+        # a file path string directly to pypdfium2: pypdfium2._open_pdf can raise
+        # PdfiumError before initializing its finalizer, leaking an open OS file handle
+        # on Windows when a path is passed directly.
+        pdf_render_state = {"doc": None, "stream": None}
+
+        def _close_render_doc():
+            doc = pdf_render_state.pop("doc", None)
+            stream = pdf_render_state.pop("stream", None)
+            try:
+                if doc is not None:
+                    doc.close()
+            finally:
+                if stream is not None:
+                    stream.close()
 
         def _render_pdf_page(page_index: int):
-            doc = getattr(thread_local, "pdf_doc", None)
+            doc = pdf_render_state.get("doc")
             if doc is None:
-                doc = pypdfium2.PdfDocument(str(pdf_path_obj))
-                thread_local.pdf_doc = doc
+                stream = pdf_path_obj.open("rb")
+                pdf_render_state["stream"] = stream
+                doc = pypdfium2.PdfDocument(stream)
+                pdf_render_state["doc"] = doc
             rendered_pages = doc.render(
                 pypdfium2.PdfBitmap.to_pil,
                 page_indices=[page_index],
@@ -1662,54 +1679,56 @@ def process_pdf_documents(args, pdf_paths: list[str]):
             img = np.array(pil_image)
             det_pre = _preprocess_detector_input(detector, img)
             if page_index == page_count - 1:
-                doc.close()
-                thread_local.pdf_doc = None
+                _close_render_doc()
             return img, det_pre
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-writer") as writer_pool:
-            write_futures = []
-            for page_index, (img, det_pre) in _iter_prefetched(range(page_count), _render_pdf_page, maxsize=3):
-                page_name = f"{output_stem}_{page_index + 1:05}.png"
-                print(f"[INFO] OCR PDF page {page_index + 1}/{page_count}: {pdf_path_obj.name}")
-                page_result = _run_ocr_on_image_array(
-                    detector=detector,
-                    recognizer30=recognizer30,
-                    recognizer50=recognizer50,
-                    recognizer100=recognizer100,
-                    inputname=page_name,
-                    img=img,
-                    outputpath=args.output,
-                    save_viz=args.viz,
-                    preprocessed_det=det_pre,
-                )
-                page_results.append(page_result)
-                all_json_contents.append(page_result["json_lines"])
-                page_infos.append({
-                    "page_index": page_index,
-                    "img_width": page_result["img_width"],
-                    "img_height": page_result["img_height"],
-                    "img_name": page_result["img_name"],
-                })
-                all_text_pages.append(page_result["text"])
-                all_page_xml.append(page_result["page_xml"])
-                if separate_page_outputs:
-                    _track_write_future(
-                        write_futures,
-                        writer_pool.submit(
-                            write_pdf_page_outputs,
-                            args.output,
-                            output_stem,
-                            page_index,
-                            page_result,
-                            source_path=str(pdf_path_obj),
-                            write_json=True,
-                            write_xml=not getattr(args, "json_only", False),
-                            write_txt=not getattr(args, "json_only", False),
-                            source_dpi=render_dpi,
-                        ),
+        try:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-writer") as writer_pool:
+                write_futures = []
+                for page_index, (img, det_pre) in _iter_prefetched(range(page_count), _render_pdf_page, maxsize=3):
+                    page_name = f"{output_stem}_{page_index + 1:05}.png"
+                    print(f"[INFO] OCR PDF page {page_index + 1}/{page_count}: {pdf_path_obj.name}")
+                    page_result = _run_ocr_on_image_array(
+                        detector=detector,
+                        recognizer30=recognizer30,
+                        recognizer50=recognizer50,
+                        recognizer100=recognizer100,
+                        inputname=page_name,
+                        img=img,
+                        outputpath=args.output,
+                        save_viz=args.viz,
+                        preprocessed_det=det_pre,
                     )
-            for fut in write_futures:
-                fut.result()
+                    page_results.append(page_result)
+                    all_json_contents.append(page_result["json_lines"])
+                    page_infos.append({
+                        "page_index": page_index,
+                        "img_width": page_result["img_width"],
+                        "img_height": page_result["img_height"],
+                        "img_name": page_result["img_name"],
+                    })
+                    all_text_pages.append(page_result["text"])
+                    all_page_xml.append(page_result["page_xml"])
+                    if separate_page_outputs:
+                        _track_write_future(
+                            write_futures,
+                            writer_pool.submit(
+                                write_pdf_page_outputs,
+                                args.output,
+                                output_stem,
+                                page_index,
+                                page_result,
+                                source_path=str(pdf_path_obj),
+                                write_json=True,
+                                write_xml=not getattr(args, "json_only", False),
+                                write_txt=not getattr(args, "json_only", False),
+                                source_dpi=render_dpi,
+                            ),
+                        )
+                for fut in write_futures:
+                    fut.result()
+        finally:
+            _close_render_doc()
 
         if not getattr(args, "json_only", False) and not separate_page_outputs:
             with open(os.path.join(args.output, output_stem + ".xml"), "w", encoding="utf-8") as wf:

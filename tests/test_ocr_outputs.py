@@ -327,6 +327,38 @@ class PdfRobustnessTest(unittest.TestCase):
                 self.assertFalse((out / f"{stem}.json").exists())
                 self.assertFalse((out / f"{stem}.txt").exists())
 
+    def test_empty_pdf_open_does_not_pass_path_or_leak_stream(self):
+        import pypdfium2
+
+        opened_inputs = []
+        orig_pdf_document = pypdfium2.PdfDocument
+
+        def _spy_pdf_document(input_data, *args, **kwargs):
+            opened_inputs.append(input_data)
+            return orig_pdf_document(input_data, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            empty_pdf = tmp / "empty.pdf"
+            _write_empty_pdf(empty_pdf)
+            out = tmp / "out"
+            args = _make_args(out)
+            with patch.object(
+                ocr, "get_detector", return_value=_StubDetector()
+            ), patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ), patch.object(
+                pypdfium2, "PdfDocument", side_effect=_spy_pdf_document
+            ):
+                ocr.process_pdf_documents(args, [str(empty_pdf)])
+
+            self.assertEqual(len(opened_inputs), 1)
+            self.assertFalse(
+                isinstance(opened_inputs[0], (str, Path)),
+                "PdfDocument must be opened via Python stream so empty PDFs do not leak OS handles on Windows",
+            )
+            self.assertTrue(opened_inputs[0].closed)
+
     def test_process_continues_after_unopenable_pdf_in_sourcedir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
