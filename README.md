@@ -85,7 +85,7 @@ AMD Ryzen 7 5800X + NVIDIA GeForce RTX 3070 (`8192 MiB`, ドライバ `617.42`, 
 
 | `--device` | Execution Provider | 対象 GPU / OS | 既定バッチ | TableCenterNet (`DeformConv`) | 要件ファイル |
 |---|---|---|---|---|---|
-| `auto` (既定) | 自動判定 | 上記優先順で最適バックエンドを選択（ソフトウェア/仮想 WebGPU は除外、不可時は `cpu`） | バックエンド準拠 | EP 準拠 | 用途に応じて選択 |
+| `auto` (既定) | 自動判定 | `CUDA > MIGraphX > ROCm > OpenVINO > WebGPU > DML > CPU` の優先順で自動選択（ソフトウェア/仮想 WebGPU は除外、不可時は `cpu`） | バックエンド準拠 | EP 準拠 | 用途に応じて選択 |
 | `cuda` | `CUDAExecutionProvider` | NVIDIA GPU (Windows / Linux、Ampere+ 互換のため `use_tf32=0` 自動適用) | `32` | 対応 (ORT 1.31.1 / 1.29.0) | [`requirements-cuda.txt`](./requirements-cuda.txt) |
 | `migraphx` | `MIGraphXExecutionProvider` | AMD Radeon (Linux ROCm 6.x+) | `32` | 対応 (ORT 1.27.1) | [`requirements-migraphx.txt`](./requirements-migraphx.txt) |
 | `rocm` | `ROCMExecutionProvider` | AMD Radeon (Linux ORT-ROCm) | `32` | 要 ORT >= 1.25 | 別ビルド ORT-ROCm |
@@ -231,9 +231,9 @@ flowchart LR
 PYTHONPATH=src:ndlocr-lite-gui .venv/bin/pytest tests ndlocr-lite-gui/tests -v
 ```
 
-- **ローカル・実機自動テスト（最新反映後、`Python 3.12.16`）**:
-  - **Linux（ローカル / WSL2 Ubuntu）**: **101 passed（+ 67 subtests）**
-  - **Windows 11**: **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS で使用不可文字を含む POSIX ファイル名テストをスキップ）
+- **ローカル・実機自動テスト（`Python 3.12.16`）**:
+  - **ローカル Linux（最新）**: **123 passed（+ 103 subtests）**
+  - **実機 Windows 11 / WSL2 Ubuntu（`c0eec1a` 時点）**: Windows 11 **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS で使用不可文字を含む POSIX ファイル名テストをスキップ） / WSL2 Ubuntu **101 passed（+ 67 subtests）**
 - **GitHub Actions CI（[ci.yml](./.github/workflows/ci.yml)）**: 履歴スナップショット（コミット `17222a9`）で全 4 ジョブ通過（`ubuntu-latest` `98 passed (+ 67 subtests)` / `windows-latest` `97 passed, 1 skipped (+ 63 subtests)`）
 - **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: コミット `11d9474` 時点で全 6 ターゲット（Windows `cuda` / `gpu-generic`、Ubuntu `cuda` / `gpu-generic`、macOS Apple Silicon / Intel）のビルド成功を確認済み
 - **実機 E2E 検証（RTX 3070 8GB: Windows 11 / WSL2 Ubuntu）および Plugin EP 検証**:

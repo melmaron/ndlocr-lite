@@ -132,8 +132,8 @@ python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --stric
 以下の環境および自動テストで動作と出力一致を検証済みです。
 
 - **自動テスト (`pytest tests ndlocr-lite-gui/tests`)**:
-  - **Linux / WSL2 Ubuntu (`Python 3.12.16`)**: **101 passed（+ 67 subtests）**
-  - **Windows 11 (`Python 3.12.16`)**: **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS 使用不可文字を含む POSIX ファイル名テストをスキップ）
+  - **ローカル Linux（最新、`Python 3.12.16`）**: **123 passed（+ 103 subtests）**
+  - **実機 Windows 11 / WSL2 Ubuntu（`c0eec1a` 時点、`Python 3.12.16`）**: Windows 11 **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS 使用不可文字を含む POSIX ファイル名テストをスキップ） / WSL2 Ubuntu **101 passed（+ 67 subtests）**
   - 公式 PARSeq 3モデル (`24x256-30` / `24x384-50` / `24x768-100`) の動的バッチパッチ (`_dynbatch_fp32_v1.onnx`) において、`batch=1` との厳密一致（`B=1` で誤差 `<= 1e-5`、動的バッチ時に `ORT_DISABLE_ALL <= 5e-3` / `ORT_ENABLE_ALL <= 2e-2` かつ `argmax` 完全一致）を検証。
   - バッチ推論 + 3段パイプライン並列実行時と CPU `batch=1` 逐次実行時で、サンプル資料の XML / JSON / TXT 出力が完全一致することを検証（縦中横バッチ処理・DEIM 分割前処理含む）。
   - ORT プロバイダの `use_tf32="0"` 設定、WebGPU ソフトウェア/仮想アダプタ除外・明示強制時の警告、DirectML での DEIM CPU フォールバック、および TableCenterNet の実 ORT バージョン表記エラーを単体テストで検証。
