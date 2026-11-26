@@ -32,6 +32,7 @@ import yaml
 import io
 import glob
 import ctypes
+import math
 from io import BytesIO
 if __package__:
     from .gui_config import build_default_config
@@ -1072,6 +1073,8 @@ def resolve_gui_engine_args(args, config_obj, cli_overrides=None):
     device_id = overrides.get('device_id') if 'device_id' in overrides else config_obj.get('device_id', 0)
     batch_size = overrides.get('batch_size') if 'batch_size' in overrides else config_obj.get('batch_size', 0)
 
+    if not isinstance(device, str):
+        device = 'auto'
     normalized_device = normalize_device_name(device)
     if normalized_device not in DEVICE_CHOICES:
         normalized_device = 'auto'
@@ -1142,7 +1145,8 @@ def load_user_config(path, defaults):
     except Exception as exc:
         warning = f'failed to load user config: {exc}'
     supported_locales = set(next(iter(TRANSLATIONS.values()), {'ja': '', 'en': ''}).keys())
-    if merged.get('langcode') not in supported_locales:
+    langcode = merged.get('langcode')
+    if not isinstance(langcode, str) or langcode not in supported_locales:
         merged['langcode'] = 'ja'
     return merged, warning
 
@@ -1163,7 +1167,7 @@ def parse_pdf_dpi(value, default=300.0, minimum=1.0):
         dpi = float(value)
     except (TypeError, ValueError):
         return float(default)
-    if dpi != dpi or dpi <= 0:
+    if not math.isfinite(dpi) or dpi <= 0:
         return float(default)
     return max(float(minimum), dpi)
 

@@ -100,6 +100,13 @@ class GuiGpuConfigTest(unittest.TestCase):
         self.assertEqual(args.device_id, 0)
         self.assertEqual(args.batch_size, 0)
 
+    def test_resolve_gui_engine_args_tolerates_non_string_device(self):
+        args = self.app.parse_gui_args([], download_models=True)
+        self.app.resolve_gui_engine_args(args, {"device": 123, "device_id": 0, "batch_size": 0}, {})
+        self.assertEqual(args.device, "auto")
+        self.assertEqual(args.device_id, 0)
+        self.assertEqual(args.batch_size, 0)
+
     def test_busy_tracker_nests_and_never_goes_negative(self):
         tracker = self.app.BusyTracker()
         self.assertFalse(tracker.active)
@@ -122,6 +129,10 @@ class GuiGpuConfigTest(unittest.TestCase):
             ("abc", 300.0),
             ("0", 300.0),
             ("-5", 300.0),
+            ("inf", 300.0),
+            ("Infinity", 300.0),
+            ("-inf", 300.0),
+            ("1e999", 300.0),
             ("nan", 300.0),
             ("0.1", 1.0),
         ]:
@@ -157,6 +168,17 @@ class GuiGpuConfigTest(unittest.TestCase):
             self.assertIsNone(warning)
             self.assertEqual(cfg["langcode"], "ja")  # unsupported locale falls back
             self.assertEqual(cfg["device"], "cuda")
+
+    def test_load_user_config_tolerates_unhashable_langcode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "userconf.yaml"
+            defaults = {"langcode": "ja", "device": "auto"}
+            for payload in ("langcode: [ja]\n", "langcode: {a: 1}\n"):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    cfg, warning = self.app.load_user_config(path, defaults)
+                    self.assertIsNone(warning)
+                    self.assertEqual(cfg["langcode"], "ja")
 
     def test_busy_tracker_fires_on_idle_only_when_outermost_task_finishes(self):
         events = []

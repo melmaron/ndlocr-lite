@@ -1587,14 +1587,14 @@ def process_pdf_documents(args, pdf_paths: list[str]):
 
     if len(pdf_paths) > 1 and getattr(args, "pdf_output", None):
         print("--pdf-output can only be used with a single PDF input.")
-        return
+        return None
 
     try:
         os.makedirs(args.output, exist_ok=True)
     except OSError as exc:
         print(f"Failed to create output directory: {args.output}")
         print(f"Error: {exc}")
-        return
+        return None
 
     print("[INFO] Intialize Model")
     detector = get_detector(args)
@@ -1609,11 +1609,18 @@ def process_pdf_documents(args, pdf_paths: list[str]):
         start = time.time()
         pdf_path_obj = Path(pdf_path)
         output_stem = pdf_path_obj.stem
-        pdf_doc_meta = pypdfium2.PdfDocument(str(pdf_path_obj))
         try:
-            page_count = len(pdf_doc_meta)
-        finally:
-            pdf_doc_meta.close()
+            pdf_doc_meta = pypdfium2.PdfDocument(str(pdf_path_obj))
+            try:
+                page_count = len(pdf_doc_meta)
+            finally:
+                pdf_doc_meta.close()
+        except (pypdfium2.PdfiumError, OSError, ValueError) as exc:
+            print(f"Failed to open PDF: {pdf_path} ({exc})")
+            continue
+        if page_count == 0:
+            print(f"Skipped empty PDF: {pdf_path}")
+            continue
 
         page_results = []
         all_json_contents = []
@@ -1724,6 +1731,13 @@ def process_pdf_documents(args, pdf_paths: list[str]):
         )
         print("Total PDF calculation time:", time.time() - start)
 
+    return {
+        "detector": detector,
+        "recognizer100": recognizer100,
+        "recognizer30": recognizer30,
+        "recognizer50": recognizer50,
+    }
+
 def process(args):
     rawinputpathlist=[]
     inputpathlist=[]
@@ -1742,8 +1756,9 @@ def process(args):
         elif ext.lower() in ["pdf",]:
             pdfpathlist.append(inputpath)
 
+    models = None
     if len(pdfpathlist) > 0:
-        process_pdf_documents(args, pdfpathlist)
+        models = process_pdf_documents(args, pdfpathlist)
         if len(inputpathlist) == 0:
             return
     if len(inputpathlist)==0:
@@ -1756,10 +1771,16 @@ def process(args):
         print(f"Error: {exc}")
         return
     
-    detector=get_detector(args)
-    recognizer100=get_recognizer(args=args)
-    recognizer30=get_recognizer(args=args,weights_path=args.rec_weights30)
-    recognizer50=get_recognizer(args=args,weights_path=args.rec_weights50)
+    if models is not None:
+        detector = models["detector"]
+        recognizer100 = models["recognizer100"]
+        recognizer30 = models["recognizer30"]
+        recognizer50 = models["recognizer50"]
+    else:
+        detector=get_detector(args)
+        recognizer100=get_recognizer(args=args)
+        recognizer30=get_recognizer(args=args,weights_path=args.rec_weights30)
+        recognizer50=get_recognizer(args=args,weights_path=args.rec_weights50)
     tatelinecnt=0
     alllinecnt=0
 

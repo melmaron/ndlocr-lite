@@ -404,20 +404,33 @@ def decode_official(
 
     # The original implementation uses BoxesFinder to accelerate this AABB
     # candidate query. Direct AABB filtering is semantically equivalent and
-    # keeps this standalone implementation much smaller.
+    # keeps this standalone implementation much smaller. The candidate AABBs
+    # are loop-invariant, so reduce them once and pre-filter each center's
+    # overlapping candidates with a vectorized predicate.
     valid_corner_polys = corner_polygons[valid_corner_indices]
+    corner_min = valid_corner_polys.min(axis=1)
+    corner_max = valid_corner_polys.max(axis=1)
 
     for i in valid_center_indices:
         origin = center_polygons[i]
+        amin = origin.min(axis=0)
+        amax = origin.max(axis=0)
+        overlap = np.flatnonzero(
+            ~(
+                (amin[0] > corner_max[:, 0])
+                | (amin[1] > corner_max[:, 1])
+                | (amax[0] < corner_min[:, 0])
+                | (amax[1] < corner_min[:, 1])
+            )
+        )
         fixed = corrected[i]
         lc_logic: List[Optional[np.ndarray]] = [None, None, None, None]
         first_fixes = 0
         replacement_fixes = 0
 
-        for local_j, j in enumerate(valid_corner_indices):
+        for local_j in overlap:
+            j = valid_corner_indices[local_j]
             candidate_poly = valid_corner_polys[local_j]
-            if not aabb_intersects(origin, candidate_poly):
-                continue
             if not any_corner_strictly_inside(origin, candidate_poly):
                 continue
 

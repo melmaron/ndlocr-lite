@@ -1,7 +1,7 @@
 # ndlocr-lite-gpu
 
-[![CI](https://github.com/melmaron/ndlocr-lite-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite-gpu/actions/workflows/ci.yml)
-[![Build Flet Cross](https://github.com/melmaron/ndlocr-lite-gpu/actions/workflows/build-flet-cross.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite-gpu/actions/workflows/build-flet-cross.yml)
+[![CI](https://github.com/melmaron/ndlocr-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite/actions/workflows/ci.yml)
+[![Build Flet Cross](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml)
 [![Upstream](https://img.shields.io/badge/upstream-ndl--lab%2Fndlocr--lite%20v2.0.0-blue)](https://github.com/ndl-lab/ndlocr-lite)
 [![License: CC BY 4.0](https://img.shields.io/badge/license-CC%20BY%204.0-lightgrey)](./LICENCE)
 
@@ -105,8 +105,8 @@ Python 3.11 以上が必要です。
 > **注意**: `onnxruntime`（CPU / Plugin EP 用）と `onnxruntime-gpu` は同一パッケージ名空間を上書きするため、同じ仮想環境に混在させないでください。CUDA へ切り替える際は先に `pip uninstall -y onnxruntime` を実行してください。
 
 ```bash
-git clone https://github.com/melmaron/ndlocr-lite-gpu.git
-cd ndlocr-lite-gpu
+git clone https://github.com/melmaron/ndlocr-lite.git
+cd ndlocr-lite
 python3 -m venv .venv
 source .venv/bin/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 ```

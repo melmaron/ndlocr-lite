@@ -4,6 +4,8 @@ They use tiny stub detectors/recognizers, bundled class definitions and a
 synthetic PDF, so they stay fast in CI and contain no external data.
 """
 from argparse import Namespace
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -122,6 +124,19 @@ def _write_pdf(path: Path, pages=2):
     pdf.save()
 
 
+def _write_empty_pdf(path: Path):
+    """A reportlab document with no pages; PDFium refuses to load it."""
+    from reportlab.pdfgen import canvas
+
+    pdf = canvas.Canvas(str(path), pagesize=(200, 150))
+    pdf.save()
+
+
+def _write_truncated_pdf(path: Path):
+    """Bytes that start like a PDF but cannot be parsed."""
+    path.write_bytes(b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+
 class OcrOutputTest(unittest.TestCase):
     def test_image_json_class_index_uses_localized_type(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -209,6 +224,28 @@ class OcrOutputTest(unittest.TestCase):
             )
             self.assertTrue(again.is_file())
 
+    def test_mixed_pdf_and_image_reuses_pdf_models(self):
+        """PDF and image in one sourcedir must initialize the models only once."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "input"
+            src.mkdir()
+            _write_png(src / "page.png")
+            _write_pdf(src / "doc.pdf", pages=1)
+            out = tmp / "out"
+            args = _make_args(out, sourcedir=str(src))
+            with patch.object(
+                ocr, "get_detector", return_value=_StubDetector()
+            ) as detector_factory, patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ) as recognizer_factory:
+                ocr.process(args)
+            self.assertEqual(detector_factory.call_count, 1)
+            self.assertEqual(recognizer_factory.call_count, 3)
+            # Both the PDF and the image produced their outputs.
+            self.assertTrue((out / "doc.xml").is_file())
+            self.assertTrue((out / "page.xml").is_file())
+
     def test_track_write_future_bounds_and_propagates(self):
         calls = []
 
@@ -235,6 +272,76 @@ class OcrOutputTest(unittest.TestCase):
             ocr._track_write_future(failing, FakeFuture("x", fail=True), limit=2)
             ocr._track_write_future(failing, FakeFuture("y"), limit=2)
 
+
+class PdfRobustnessTest(unittest.TestCase):
+    """Unopenable or empty PDFs must be skipped, not abort the whole batch."""
+
+    def _assert_valid_pdf_outputs(self, out: Path):
+        for suffix in (".xml", ".json", ".txt"):
+            self.assertTrue(
+                (out / f"doc{suffix}").is_file(), f"doc{suffix} was not generated"
+            )
+        payload = json.loads((out / "doc.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["pdfinfo"]["page_count"], 1)
+        self.assertEqual(
+            sorted(line["class_index"] for line in payload["contents"][0]),
+            [1, 2],
+        )
+        self.assertIn('TYPE="本文"', (out / "doc.xml").read_text(encoding="utf-8"))
+        lines = [
+            line
+            for line in (out / "doc.txt").read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(set(lines), {"TESTLINE"})
+        self.assertTrue((out / "doc_text.pdf").is_file())
+
+    def test_process_pdf_documents_skips_unopenable_and_empty_pdfs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            empty_pdf = tmp / "empty.pdf"
+            _write_empty_pdf(empty_pdf)
+            self.assertGreater(empty_pdf.stat().st_size, 0)
+            broken_pdf = tmp / "broken.pdf"
+            _write_truncated_pdf(broken_pdf)
+            valid_pdf = tmp / "doc.pdf"
+            _write_pdf(valid_pdf, pages=1)
+            out = tmp / "out"
+            args = _make_args(out)
+            captured = io.StringIO()
+            with patch.object(
+                ocr, "get_detector", return_value=_StubDetector()
+            ), patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ), contextlib.redirect_stdout(captured):
+                ocr.process_pdf_documents(
+                    args, [str(empty_pdf), str(broken_pdf), str(valid_pdf)]
+                )
+            self._assert_valid_pdf_outputs(out)
+            # The bad inputs are reported and produce no document outputs.
+            log = captured.getvalue()
+            self.assertIn("empty.pdf", log)
+            self.assertIn("broken.pdf", log)
+            for stem in ("empty", "broken"):
+                self.assertFalse((out / f"{stem}.xml").exists())
+                self.assertFalse((out / f"{stem}.json").exists())
+                self.assertFalse((out / f"{stem}.txt").exists())
+
+    def test_process_continues_after_unopenable_pdf_in_sourcedir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "input"
+            src.mkdir()
+            _write_empty_pdf(src / "empty.pdf")
+            _write_truncated_pdf(src / "broken.pdf")
+            _write_pdf(src / "doc.pdf", pages=1)
+            out = tmp / "out"
+            args = _make_args(out, sourcedir=str(src))
+            with patch.object(ocr, "get_detector", return_value=_StubDetector()), patch.object(
+                ocr, "get_recognizer", return_value=_StubRecognizer("TESTLINE")
+            ):
+                ocr.process(args)
+            self._assert_valid_pdf_outputs(out)
 
 
 class XmlFilenameEscapingTest(unittest.TestCase):

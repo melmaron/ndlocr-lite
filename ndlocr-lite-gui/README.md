@@ -38,7 +38,7 @@ https://flet.dev/docs/publish/windows/
 #(コマンドプロンプトを利用、ndlocr-lite-guiと同階層で実行する)
 python3 -m venv ocrenv
 .\ocrenv\Scripts\activate
-pip install flet==0.27.6
+pip install flet==1.1.2
 xcopy ..\src .\src
 flet build windows
 ```
@@ -49,7 +49,7 @@ flet build windows
 #(ndlocr-lite-guiと同階層で実行する)
 python3 -m venv ocrenv
 source ./ocrenv/bin/activate
-pip install flet==0.27.6
+pip install flet==1.1.2
 cp -r ../src .
 flet build macos
 ```
@@ -59,7 +59,7 @@ flet build macos
 #(ndlocr-lite-guiと同階層で実行する)
 python3 -m venv ocrenv
 source ./ocrenv/bin/activate
-pip install flet==0.27.6
+pip install flet==1.1.2
 cp -r ../src .
 flet build linux
 ```

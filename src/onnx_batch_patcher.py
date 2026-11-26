@@ -106,6 +106,10 @@ def is_valid_dynamic_batch_cache(model_path: str | Path) -> bool:
             # Without the onnx package we cannot validate; let ONNX Runtime try.
             return True
         model = onnx.load(str(path), load_external_data=False)
+        # A cache cut at the trailing opset_import field still parses as protobuf,
+        # but ONNX Runtime rejects it ("Missing opset in the model"); reject here.
+        if not model.opset_import or not model.graph.node:
+            return False
         if not model.graph.input:
             return False
         dims = model.graph.input[0].type.tensor_type.shape.dim
@@ -134,6 +138,7 @@ def _prune_unused_constants(model) -> None:
         # If/Loop/Scan body; without a recursive liveness walk, keep them.
         return
     used = {output.name for output in graph.output if output.name}
+    used.update(inp.name for inp in graph.input if inp.name)
     for node in reversed(list(graph.node)):
         if node.op_type == "Constant" and node.output and node.output[0] not in used:
             continue
