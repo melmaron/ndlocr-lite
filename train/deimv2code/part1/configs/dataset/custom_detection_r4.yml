@@ -11,8 +11,8 @@ train_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /data1/extend_DEIM/addcharcntdataset/extra_morphr4cocotrain_addtitleteikokukoten/img
-    ann_file: /data1/extend_DEIM/addcharcntdataset/extra_morphr4cocotrain_addtitleteikokukoten.json
+    img_folder: ./data/extra_morphr4cocotrain_addtitleteikokukoten/img
+    ann_file: ./data/extra_morphr4cocotrain_addtitleteikokukoten.json
     return_masks: False
     transforms:
       type: Compose
@@ -28,8 +28,8 @@ val_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/t-aoike/smartocrproject/rtmdet/morphr4cocovalid/img
-    ann_file: /home/t-aoike/smartocrproject/rtmdet/morphr4cocovalid/morphr4cocovalid_addtitle.json
+    img_folder: ./data/morphr4cocovalid/img
+    ann_file: ./data/morphr4cocovalid_addtitle.json
     return_masks: False
     transforms:
       type: Compose
