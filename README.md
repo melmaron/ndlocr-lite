@@ -1,7 +1,7 @@
-# ndlocr-lite-gpu
+# ndlocr-gpu
 
-[![CI](https://github.com/melmaron/ndlocr-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite/actions/workflows/ci.yml)
-[![Build Flet Cross](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml/badge.svg)](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml)
+[![CI](https://github.com/melmaron/ndlocr-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/melmaron/ndlocr-gpu/actions/workflows/ci.yml)
+[![Build Flet Cross](https://github.com/melmaron/ndlocr-gpu/actions/workflows/build-flet-cross.yml/badge.svg)](https://github.com/melmaron/ndlocr-gpu/actions/workflows/build-flet-cross.yml)
 [![Upstream](https://img.shields.io/badge/upstream-ndl--lab%2Fndlocr--lite%20v2.0.0-blue)](https://github.com/ndl-lab/ndlocr-lite)
 [![License: CC BY 4.0](https://img.shields.io/badge/license-CC%20BY%204.0-lightgrey)](./LICENCE)
 
@@ -20,7 +20,7 @@
 
 ## ダウンロード
 
-GUI デスクトップアプリケーションのビルド済みパッケージは、**[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite/releases)** からダウンロードできます（最新の開発ビルドは [GitHub Actions (`build-flet-cross`)](https://github.com/melmaron/ndlocr-lite/actions/workflows/build-flet-cross.yml) の Artifacts からも入手可能です）。
+GUI デスクトップアプリケーションのビルド済みパッケージは、**[GitHub Releases ページ](https://github.com/melmaron/ndlocr-gpu/releases)** からダウンロードできます（最新の開発ビルドは [GitHub Actions (`build-flet-cross`)](https://github.com/melmaron/ndlocr-gpu/actions/workflows/build-flet-cross.yml) の Artifacts からも入手可能です）。
 
 | OS | GPU / 環境 | ダウンロード対象ファイル名 |
 |---|---|---|
@@ -41,7 +41,7 @@ GUI デスクトップアプリケーションのビルド済みパッケージ�
 
 v2.0.0 標準の PDF 入出力・縦中横 (`--enable-tcy`)・表構造認識 (`TableCenterNet`)・Flet GUI はそのまま引き継ぎつつ、推論バックエンドとパイプラインを拡張した。
 
-| 項目 | 本家 `ndl-lab/ndlocr-lite` v2.0.0 | 本フォーク (`ndlocr-lite-gpu`) |
+| 項目 | 本家 `ndl-lab/ndlocr-lite` v2.0.0 | 本フォーク (`ndlocr-gpu`) |
 |---|---|---|
 | **推論デバイス (`--device`)** | `cpu`（既定）または `cuda` の 2 択 | `auto`（既定）で `cuda > migraphx > rocm > openvino > webgpu > dml > cpu` を自動選択。失敗時は `cpu` へフォールバック（`--strict-device` / `--check-device` 対応） |
 | **AMD Radeon / Intel Arc** | 非対応 | ONNX Runtime `1.31.1` + Plugin EP（`webgpu` / `openvino`）および Linux ROCm（`migraphx` / `rocm`）に対応。**TableCenterNet (`DeformConv`)** も汎用 GPU 上で動作 |
@@ -81,7 +81,7 @@ AMD Ryzen 7 5800X + NVIDIA GeForce RTX 3070 (`8192 MiB`, ドライバ `617.42`, 
 | WSL2 Ubuntu / CUDA 12 動的 `batch=32` + 並列 | `1.29.0` | **8.340 秒** | **1.439 p/s** | 3.047 秒 | 3.939 p/s | +1,561 MiB |
 
 - **従来版に対する大幅な高速化**: 高速なデスクトップ CPU 環境では従来の `CUDA batch=1`（定常 `16.563 秒`）は `CPU batch=1`（`11.961 秒`）より遅くなることがありましたが、本フォークの動的バッチ＋3段パイプラインにより Windows 11 で **定常 `2.537 秒`（従来 CPU 比 4.71x、従来 GPU 比 6.53x）**、一括 12p でも **`12.055 秒`（WSL2 では最短 `8.340 秒`）** まで短縮しています
-- **VRAM 節約と速度のバランス**: `--batch-size 16` でも Windows 11 で定常 `4.173 p/s`・WSL2 で一括 `8.946 秒` と高い性能を維持しつつ VRAM 増分を約 `300〜400 MiB` 抑えられるため、4 GB 級 VRAM GPU にも向きます
+- **VRAM 節約と速度のバランス**: `--batch-size 16` でも Windows 11 で定常 `4.173 p/s`・WSL2 で一括 `8.946 秒` と高い性能を維持しつつ VRAM 増分を約 `280〜400 MiB` 抑えられるため、4 GB 級 VRAM GPU にも向きます
 - **出力一致と各バックエンド検証**: Windows 11 / WSL2 の CUDA 13 (`ORT 1.31.1`)・CUDA 12 (`ORT 1.29.0`)・DirectML ハイブリッド (`ORT 1.24.4`: `DEIM CPU + PARSeq DML`) のすべてで、同梱 5 画像（通常・`--enable-tcy`）および 3 ページ PDF E2E の CPU `batch=1` 完全一致（差分 0）を確認済みです（`TableCenterNet v3` の CUDA 動作・同一 3 セル出力も検証済み）
 
 <details>
@@ -136,13 +136,13 @@ Google Colab T4 Standard（`Tesla T4 15360 MiB`、NVIDIA driver `580.82.07`、`P
 
 ### 1. CLI 環境構築と実行
 
-Python 3.11 以上が必要です。
+Python 3.11 以上が必要です（GUI 版は Python 3.13 まで）。
 
 > **注意**: `onnxruntime`（CPU / Plugin EP 用）と `onnxruntime-gpu` は同一パッケージ名空間を上書きするため、同じ仮想環境に混在させないでください。CUDA へ切り替える際は先に `pip uninstall -y onnxruntime` を実行してください。
 
 ```bash
-git clone https://github.com/melmaron/ndlocr-lite.git
-cd ndlocr-lite
+git clone https://github.com/melmaron/ndlocr-gpu.git
+cd ndlocr-gpu
 python3 -m venv .venv
 source .venv/bin/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 ```
@@ -271,7 +271,7 @@ PYTHONPATH=src:ndlocr-lite-gui .venv/bin/pytest tests ndlocr-lite-gui/tests -v
   - **ローカル Linux（最新）**: **124 passed（+ 103 subtests）**
   - **実機 Windows 11 / WSL2 Ubuntu（`c0eec1a` 時点）**: Windows 11 **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS で使用不可文字を含む POSIX ファイル名テストをスキップ） / WSL2 Ubuntu **101 passed（+ 67 subtests）**
 - **GitHub Actions CI（[ci.yml](./.github/workflows/ci.yml)）**: 履歴スナップショット（コミット `17222a9`）で全 4 ジョブ通過（`ubuntu-latest` `98 passed (+ 67 subtests)` / `windows-latest` `97 passed, 1 skipped (+ 63 subtests)`）
-- **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: コミット `3f2939a` 時点で全 6 ターゲット（Windows `cuda` / `gpu-generic`、Ubuntu `cuda` / `gpu-generic`、macOS Apple Silicon / Intel）のビルド成功と [Releases](https://github.com/melmaron/ndlocr-lite/releases/tag/2.0.0)（`2.0.0`）への公開を確認済み
+- **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: コミット `3f2939a` 時点で全 6 ターゲット（Windows `cuda` / `gpu-generic`、Ubuntu `cuda` / `gpu-generic`、macOS Apple Silicon / Intel）のビルド成功と [Releases](https://github.com/melmaron/ndlocr-gpu/releases/tag/2.0.0)（`2.0.0`）への公開を確認済み
 - **実機 E2E 検証（RTX 3070 8GB: Windows 11 / WSL2 Ubuntu）および Plugin EP 検証**:
   - Windows 11 / WSL2 双方で CUDA 13 (`ORT 1.31.1` + pip CUDA 13 runtime wheel) と CUDA 12 (`ORT 1.29.0`)、および Windows DirectML ハイブリッド (`ORT 1.24.4`: `DEIM CPU + PARSeq DML`) を検証し、5 画像（通常・`--enable-tcy`）と 3 ページ PDF E2E の全てで CPU `batch=1` 完全一致（差分 0）を確認済み
   - WSL2 仮想 WebGPU アダプタ (`vid=0x1414`) の `auto` スキップ・`--device webgpu` 強制時の警告、Windows `onnxruntime-ep-webgpu==0.6.0` の DXC コンパイルエラー時 CPU フォールバック、および汎用 Linux Vulkan GPU 上の WebGPU 実機推論を確認済み
