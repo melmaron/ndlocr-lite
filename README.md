@@ -32,7 +32,6 @@ GUI デスクトップアプリケーションのビルド済みパッケージ�
 > [!NOTE]
 > - 展開後のフォルダは **日本語（全角文字）を含まないパス**（例: `C:\ndlocr-lite\`）に配置して起動してください。
 > - **`cuda` 版に CUDA 13 / cuDNN 9 ランタイムは同梱されていません**（容量肥大回避のため）。CUDA 12 のみや未導入の環境では CPU へフォールバックし、画面上部の警告バナー・「環境診断」ダイアログ・ログファイル (`ndlocr-lite.log`) に不足ライブラリ名と対処法が表示されます。
-> - **macOS 版**: 実機検証が無く、CoreML EP 未対応（CPU 専用）かつ `onnxruntime==1.23.2` 固定で `TableCenterNet` 非対応となるため、本フォークの配布ビルド対象外としています（macOS 利用者は上流 [`ndl-lab/ndlocr-lite`](https://github.com/ndl-lab/ndlocr-lite) をご利用ください）。
 > - **AMD MIGraphX / ROCm**: 配布バイナリには含まれず、Linux ROCm 環境でのソース導入限定です（配布パッケージの AMD GPU は `gpu_generic` / WebGPU を利用）。
 > - CLI 版や Python ソースから直接実行したい場合は、下の [セットアップと使い方](#セットアップと使い方) を参照してください。
 
