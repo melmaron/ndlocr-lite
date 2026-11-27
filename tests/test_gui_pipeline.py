@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
+import logging
 from pathlib import Path
 import sys
 import tempfile
@@ -647,150 +648,158 @@ class GuiPipelineTest(unittest.TestCase):
                     self.app.load_runtime_modules()
                     return det, rec100, rec30, rec50
 
-                with patch.object(self.app, "USER_CONFIG_PATH", conf_path), patch.object(
-                    self.app, "APP_DATA_DIR", tmp_root
-                ), patch.object(self.app, "APP_TEMP_DIR", tmp_root / "tmp"), patch.object(
-                    self.app, "PDFTMPPATH", str(tmp_root / "tmp" / "pdfprev")
-                ), patch.object(
-                    self.app, "load_ocr_models", side_effect=fake_load_models
-                ), patch.object(
-                    self.app, "load_table_recognizer", return_value=None
-                ), patch.object(
-                    ft.Control, "update", lambda self: None
-                ):
-                    self.app.main(fake_page, args=args, download_models=False)
-                    # Drain initial initialize_models task queued via page.run_task
-                    while fake_page.pending_tasks:
-                        await fake_page.pending_tasks.pop(0)
+                parent_logger = logging.getLogger("ndlocr")
+                orig_handlers = list(parent_logger.handlers)
+                orig_log_path = self.app.GUI_LOG_PATH
+                try:
+                    with patch.object(self.app, "USER_CONFIG_PATH", conf_path), patch.object(
+                        self.app, "APP_DATA_DIR", tmp_root
+                    ), patch.object(self.app, "APP_TEMP_DIR", tmp_root / "tmp"), patch.object(
+                        self.app, "PDFTMPPATH", str(tmp_root / "tmp" / "pdfprev")
+                    ), patch.object(
+                        self.app, "load_ocr_models", side_effect=fake_load_models
+                    ), patch.object(
+                        self.app, "load_table_recognizer", return_value=None
+                    ), patch.object(
+                        ft.Control, "update", lambda self: None
+                    ):
+                        self.app.main(fake_page, args=args, download_models=False)
+                        # Drain initial initialize_models task queued via page.run_task
+                        while fake_page.pending_tasks:
+                            await fake_page.pending_tasks.pop(0)
 
-                    dialog_controls = {}
-                    # Trigger UI construction lookup from main_controls + customize_btn closure
-                    by_key = _collect_controls_by_key(fake_page.controls)
-                    chkbx_viz = by_key["visualize"]
-                    ocr_btn = by_key["run_ocr"]
-                    customize_btn = by_key["customize_output"]
-                    pick_file_btn = by_key["select_input_file"]
+                        # Trigger UI construction lookup from main_controls + customize_btn closure
+                        by_key = _collect_controls_by_key(fake_page.controls)
+                        chkbx_viz = by_key["visualize"]
+                        ocr_btn = by_key["run_ocr"]
+                        customize_btn = by_key["customize_output"]
+                        pick_file_btn = by_key["select_input_file"]
 
-                    # 1. Visualize checkbox initializes from config (False) and persists toggle.
-                    self.assertFalse(chkbx_viz.value)
-                    chkbx_viz.value = True
-                    chkbx_viz.on_change(None)
-                    reloaded_conf = yaml.safe_load(conf_path.read_text(encoding="utf-8"))
-                    self.assertTrue(reloaded_conf["visualize"])
+                        # 1. Visualize checkbox initializes from config (False) and persists toggle.
+                        self.assertFalse(chkbx_viz.value)
+                        chkbx_viz.value = True
+                        chkbx_viz.on_change(None)
+                        reloaded_conf = yaml.safe_load(conf_path.read_text(encoding="utf-8"))
+                        self.assertTrue(reloaded_conf["visualize"])
 
-                    # 2. PDF resolution field stays editable even when chkbx_pdf is False!
-                    customize_btn.on_click(None)
-                    self.assertTrue(fake_page.dialogs)
-                    dlg = fake_page.dialogs[-1]
-                    dlg_keys = _collect_controls_by_key([dlg.content])
-                    pdf_cb = dlg_keys["output_pdf"]
-                    pdf_dpi_field = dlg_keys["output_pdf_resolution"]
-                    save_btn = _collect_controls_by_key(dlg.actions)["customize_output_ok"]
+                        # 2. PDF resolution field stays editable even when chkbx_pdf is False!
+                        customize_btn.on_click(None)
+                        self.assertTrue(fake_page.dialogs)
+                        dlg = fake_page.dialogs[-1]
+                        dlg_keys = _collect_controls_by_key([dlg.content])
+                        pdf_cb = dlg_keys["output_pdf"]
+                        pdf_dpi_field = dlg_keys["output_pdf_resolution"]
+                        save_btn = _collect_controls_by_key(dlg.actions)["customize_output_ok"]
 
-                    self.assertFalse(pdf_cb.value)
-                    self.assertFalse(bool(pdf_dpi_field.disabled))
-                    pdf_cb.value = True
-                    pdf_cb.on_change(None)
-                    self.assertFalse(bool(pdf_dpi_field.disabled))
-                    pdf_cb.value = False
-                    pdf_cb.on_change(None)
-                    self.assertFalse(bool(pdf_dpi_field.disabled))
+                        self.assertFalse(pdf_cb.value)
+                        self.assertFalse(bool(pdf_dpi_field.disabled))
+                        pdf_cb.value = True
+                        pdf_cb.on_change(None)
+                        self.assertFalse(bool(pdf_dpi_field.disabled))
+                        pdf_cb.value = False
+                        pdf_cb.on_change(None)
+                        self.assertFalse(bool(pdf_dpi_field.disabled))
 
-                    # Edit DPI to 120 while chkbx_pdf is still False and save!
-                    pdf_dpi_field.value = "120"
-                    save_btn.on_click(None)
-                    saved_conf = yaml.safe_load(conf_path.read_text(encoding="utf-8"))
-                    self.assertEqual(saved_conf["pdf_resolution"], 120)
+                        # Edit DPI to 120 while chkbx_pdf is still False and save!
+                        pdf_dpi_field.value = "120"
+                        save_btn.on_click(None)
+                        saved_conf = yaml.safe_load(conf_path.read_text(encoding="utf-8"))
+                        self.assertEqual(saved_conf["pdf_resolution"], 120)
 
-                    # 3. Run full 5-page PDF OCR via GUI pipeline, counting PdfDocument opens and DEIM calls.
-                    self.app.load_runtime_modules()
-                    open_paths_in_pdfium = 0
-                    orig_pdfium = pypdfium2.PdfDocument
+                        # 3. Run full 5-page PDF OCR via GUI pipeline, counting PdfDocument opens and DEIM calls.
+                        self.app.load_runtime_modules()
+                        open_paths_in_pdfium = 0
+                        orig_pdfium = pypdfium2.PdfDocument
 
-                    class CountingPdfDoc:
-                        def __init__(self, stream_or_path):
-                            nonlocal open_paths_in_pdfium
-                            if hasattr(stream_or_path, "read"):
-                                open_paths_in_pdfium += 1
-                            self._inner = orig_pdfium(stream_or_path)
+                        class CountingPdfDoc:
+                            def __init__(self, stream_or_path):
+                                nonlocal open_paths_in_pdfium
+                                if hasattr(stream_or_path, "read"):
+                                    open_paths_in_pdfium += 1
+                                self._inner = orig_pdfium(stream_or_path)
 
-                        def __len__(self):
-                            return len(self._inner)
+                            def __len__(self):
+                                return len(self._inner)
 
-                        def render(self, *a, **kw):
-                            return self._inner.render(*a, **kw)
+                            def render(self, *a, **kw):
+                                return self._inner.render(*a, **kw)
 
-                        def close(self):
-                            return self._inner.close()
+                            def close(self):
+                                return self._inner.close()
 
-                    file_picker = next(
-                        s for s in fake_page.services if isinstance(s, ft.FilePicker)
-                    )
+                        file_picker = next(
+                            s for s in fake_page.services if isinstance(s, ft.FilePicker)
+                        )
 
-                    async def fake_pick_files(**_kw):
-                        return [SimpleNamespace(path=str(sample_pdf))]
+                        async def fake_pick_files(**_kw):
+                            return [SimpleNamespace(path=str(sample_pdf))]
 
-                    # Spy on _run_ocr_on_image_array kwargs to assert preprocessed_det & include_markdown=False
-                    seen_ocr_kwargs = []
-                    orig_run_ocr = ocr._run_ocr_on_image_array
+                        # Spy on _run_ocr_on_image_array kwargs to assert preprocessed_det & include_markdown=False
+                        seen_ocr_kwargs = []
+                        orig_run_ocr = ocr._run_ocr_on_image_array
 
-                    def spy_run_ocr(**kwargs):
-                        seen_ocr_kwargs.append({
-                            "has_pre": kwargs.get("preprocessed_det") is not None,
-                            "include_markdown": kwargs.get("include_markdown"),
-                        })
-                        return orig_run_ocr(**kwargs)
+                        def spy_run_ocr(**kwargs):
+                            seen_ocr_kwargs.append({
+                                "has_pre": kwargs.get("preprocessed_det") is not None,
+                                "include_markdown": kwargs.get("include_markdown"),
+                            })
+                            return orig_run_ocr(**kwargs)
 
-                    with patch.object(file_picker, "pick_files", side_effect=fake_pick_files), patch.object(
-                        self.app.pypdfium2, "PdfDocument", CountingPdfDoc
-                    ), patch.object(ocr, "_run_ocr_on_image_array", side_effect=spy_run_ocr):
-                        await pick_file_btn.on_click(None)
+                        with patch.object(file_picker, "pick_files", side_effect=fake_pick_files), patch.object(
+                            self.app.pypdfium2, "PdfDocument", CountingPdfDoc
+                        ), patch.object(ocr, "_run_ocr_on_image_array", side_effect=spy_run_ocr):
+                            await pick_file_btn.on_click(None)
+                            await ocr_btn.on_click(None)
+
+                        # Preview render (1) + allsum count (1) + page_count (1) + prefetcher render (1) = 4 opens (< 5 pages!)
+                        # Previously this would have been 1 + 1 + 1 + 5 = 8 opens across 5 pages.
+                        self.assertEqual(open_paths_in_pdfium, 4)
+                        self.assertEqual(len(seen_ocr_kwargs), 5)
+                        self.assertTrue(all(item["has_pre"] for item in seen_ocr_kwargs))
+                        self.assertTrue(all(item["include_markdown"] is False for item in seen_ocr_kwargs))
+                        self.assertEqual(det.detect_from_preprocessed_calls, 5)
+                        self.assertEqual(det.detect_calls, 0)
+
+                        # Verify per-page PDF outputs + viz PNG + combined Markdown exist and reflect 120 DPI
+                        for page_num in range(1, 6):
+                            stem = f"book_{page_num:05}"
+                            self.assertTrue((out_dir / f"{stem}.txt").is_file())
+                            self.assertTrue((out_dir / f"{stem}.xml").is_file())
+                            self.assertTrue((out_dir / f"{stem}_tei.xml").is_file())
+                            j = json.loads((out_dir / f"{stem}.json").read_text(encoding="utf-8"))
+                            self.assertEqual(j["imginfo"]["source_dpi"], 120.0)
+                            self.assertEqual(j["contents"][0][0]["text"], "短行")
+                            self.assertTrue((out_dir / f"viz_{stem}.png").is_file())
+                        self.assertTrue((out_dir / "book.md").is_file())
+
+                        # 4. Also test standalone directory images through GUI pipeline with TEI & PDF outputs.
+                        img_out_dir = tmp_root / "img_out"
+                        img_out_dir.mkdir()
+
+                        # Configure output dir via pick_output_result
+                        dir_pick_btn = by_key["select_input_directory"]
+                        out_pick_btn = by_key["select_output_directory"]
+                        with patch.object(
+                            file_picker, "get_directory_path", side_effect=[str(img_dir), str(img_out_dir)]
+                        ):
+                            await dir_pick_btn.on_click(None)
+                            await out_pick_btn.on_click(None)
                         await ocr_btn.on_click(None)
 
-                    # Preview render (1) + allsum count (1) + page_count (1) + prefetcher render (1) = 4 opens (< 5 pages!)
-                    # Previously this would have been 1 + 1 + 1 + 5 = 8 opens across 5 pages.
-                    self.assertEqual(open_paths_in_pdfium, 4)
-                    self.assertEqual(len(seen_ocr_kwargs), 5)
-                    self.assertTrue(all(item["has_pre"] for item in seen_ocr_kwargs))
-                    self.assertTrue(all(item["include_markdown"] is False for item in seen_ocr_kwargs))
-                    self.assertEqual(det.detect_from_preprocessed_calls, 5)
-                    self.assertEqual(det.detect_calls, 0)
-
-                    # Verify per-page PDF outputs + viz PNG + combined Markdown exist and reflect 120 DPI
-                    for page_num in range(1, 6):
-                        stem = f"book_{page_num:05}"
-                        self.assertTrue((out_dir / f"{stem}.txt").is_file())
-                        self.assertTrue((out_dir / f"{stem}.xml").is_file())
-                        self.assertTrue((out_dir / f"{stem}_tei.xml").is_file())
-                        j = json.loads((out_dir / f"{stem}.json").read_text(encoding="utf-8"))
-                        self.assertEqual(j["imginfo"]["source_dpi"], 120.0)
-                        self.assertEqual(j["contents"][0][0]["text"], "短行")
-                        self.assertTrue((out_dir / f"viz_{stem}.png").is_file())
-                    self.assertTrue((out_dir / "book.md").is_file())
-
-                    # 4. Also test standalone directory images through GUI pipeline with TEI & PDF outputs.
-                    img_out_dir = tmp_root / "img_out"
-                    img_out_dir.mkdir()
-                    async def fake_pick_dir():
-                        return str(img_dir)
-
-                    # Configure output dir via pick_output_result and enable PDF output
-                    dir_pick_btn = by_key["select_input_directory"]
-                    out_pick_btn = by_key["select_output_directory"]
-                    with patch.object(
-                        file_picker, "get_directory_path", side_effect=[str(img_dir), str(img_out_dir)]
-                    ):
-                        await dir_pick_btn.on_click(None)
-                        await out_pick_btn.on_click(None)
-                    await ocr_btn.on_click(None)
-
-                    for idx in range(2):
-                        self.assertTrue((img_out_dir / f"pic_{idx}.txt").is_file())
-                        self.assertTrue((img_out_dir / f"pic_{idx}.xml").is_file())
-                        self.assertTrue((img_out_dir / f"pic_{idx}.json").is_file())
-                        self.assertTrue((img_out_dir / f"pic_{idx}.md").is_file())
-                        self.assertTrue((img_out_dir / f"viz_pic_{idx}.png").is_file())
-                    self.assertTrue((img_out_dir / "pic_0_tei.xml").is_file())
+                        for idx in range(2):
+                            self.assertTrue((img_out_dir / f"pic_{idx}.txt").is_file())
+                            self.assertTrue((img_out_dir / f"pic_{idx}.xml").is_file())
+                            self.assertTrue((img_out_dir / f"pic_{idx}.json").is_file())
+                            self.assertTrue((img_out_dir / f"pic_{idx}.md").is_file())
+                            self.assertTrue((img_out_dir / f"viz_pic_{idx}.png").is_file())
+                        self.assertTrue((img_out_dir / "pic_0_tei.xml").is_file())
+                finally:
+                    # Windows refuses to unlink ndlocr-lite.log while RotatingFileHandler keeps it open.
+                    for h in list(parent_logger.handlers):
+                        if h not in orig_handlers:
+                            parent_logger.removeHandler(h)
+                            h.close()
+                    self.app.GUI_LOG_PATH = orig_log_path
 
         asyncio.run(run_gui_test())
 
