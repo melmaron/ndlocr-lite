@@ -212,6 +212,52 @@ class CliArgumentsTest(unittest.TestCase):
                 args = self.parse_cli(flag, raw)
                 self.assertEqual(args.pdf_render_dpi, expected)
 
+    def test_precision_cli_options_and_recognizer_forwarding(self):
+        default_args = self.parse_cli()
+        self.assertEqual(default_args.precision, "fp32")
+
+        for prec in ("fp32", "fp16"):
+            with self.subTest(precision=prec):
+                args = self.parse_cli("--precision", prec)
+                self.assertEqual(args.precision, prec)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            argv = ["ocr.py", "--sourceimg", "sample.png", "--output", "output", "--precision", "int8"]
+            with patch.object(sys, "argv", argv), patch.object(ocr, "process") as process:
+                with self.assertRaises(SystemExit) as error:
+                    ocr.main()
+            self.assertEqual(error.exception.code, 2)
+            process.assert_not_called()
+
+        root = Path(__file__).resolve().parents[1]
+        model = root / "src" / "model" / "parseq-ndl-24x256-30-tiny-499epoch-261124.onnx"
+        classes = root / "src" / "config" / "NDLmoji.yaml"
+        if not model.is_file() or not classes.is_file():
+            self.skipTest("Bundled PARSeq model missing")
+        fwd_args = Namespace(
+            rec_weights=str(model),
+            rec_classes=str(classes),
+            device="cuda",
+            device_id=0,
+            batch_size=64,
+            strict_device=False,
+            precision="fp16",
+            enable_tcy=False,
+        )
+        with patch.object(ocr, "PARSEQ", return_value=object()) as mock_parseq, patch.object(
+            ocr, "_load_charlist", return_value=("a",)
+        ):
+            ocr.get_recognizer(fwd_args)
+        mock_parseq.assert_called_once_with(
+            model_path=str(model),
+            charlist=["a"],
+            device="cuda",
+            device_id=0,
+            batch_size=64,
+            strict_device=False,
+            precision="fp16",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

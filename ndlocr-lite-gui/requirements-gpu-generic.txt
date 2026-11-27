@@ -13,6 +13,7 @@ pypdfium2==4.30.0
 numpy==2.2.2
 opencv-python-headless==4.11.0.86
 onnxruntime==1.31.1; python_version >= "3.11" and sys_platform != "darwin"
+# Note: Python 3.10 and macOS (darwin) are unsupported for prebuilt GUI builds; ORT 1.23.2 disables TableCenterNet (requires ORT >= 1.25).
 onnxruntime==1.23.2; python_version == "3.10" or sys_platform == "darwin"
 onnxruntime-ep-webgpu==0.6.0; python_version >= "3.11" and sys_platform != "darwin"
 onnxruntime-ep-openvino==1.8.1; python_version >= "3.11" and sys_platform != "darwin" and (platform_machine == "x86_64" or platform_machine == "AMD64")

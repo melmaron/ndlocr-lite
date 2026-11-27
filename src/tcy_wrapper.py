@@ -65,6 +65,23 @@ class TateChuYokoWrapper:
     def backend_profile(self):
         return getattr(self._rec, "backend_profile", None)
 
+    @property
+    def effective_precision(self) -> str:
+        return str(getattr(self._rec, "effective_precision", "fp32"))
+
+    @property
+    def requested_precision(self) -> str:
+        return str(getattr(self._rec, "requested_precision", self.effective_precision))
+
+    @property
+    def precision_fallback_occurred(self) -> bool:
+        return bool(getattr(self._rec, "precision_fallback_occurred", False))
+
+    def warmup(self) -> None:
+        fn = getattr(self._rec, "warmup", None)
+        if callable(fn):
+            fn()
+
     def read(self, img: np.ndarray) -> str:
         if img is None or img.size == 0:
             return ""
@@ -226,6 +243,8 @@ class TateChuYokoWrapper:
         else:
             input_tensor = self._preprocess_no_rotation(img)
         outputs = rec.session.run(rec.output_names, {rec.input_names[0]: input_tensor})[0]
+        if outputs.dtype == np.float16:
+            outputs = outputs.astype(np.float32)
         probs = _softmax(outputs, axis=2)
         indices = np.argmax(probs, axis=2)[0]
         max_probs = np.max(probs, axis=2)[0]
@@ -241,7 +260,7 @@ class TateChuYokoWrapper:
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
         resized = cv2.resize(img, (rec.input_width, rec.input_height), interpolation=cv2.INTER_LINEAR)
-        input_image = np.ascontiguousarray(resized[:, :, ::-1]).astype(np.float32)
+        input_image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
         input_image /= 127.5
         input_image -= 1.0
         input_image = input_image.transpose(2, 0, 1)

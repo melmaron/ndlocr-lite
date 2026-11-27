@@ -622,7 +622,15 @@ def make_session_with_profile(
     device_id: int = 0,
     strict_device: bool = False,
 ):
-    from ort_provider import create_inference_session
+    from ort_provider import create_inference_session, ort_supports_deform_conv
+
+    ort_ver = getattr(ort, "__version__", "unknown")
+    if not ort_supports_deform_conv(ort_ver):
+        raise RuntimeError(
+            "TableCenterNet requires ONNX DeformConv (ONNX Runtime >= 1.25), "
+            f"which is not supported by installed onnxruntime=={ort_ver}. "
+            "Use ORT 1.25+ or disable table structure estimation."
+        )
 
     try:
         return create_inference_session(
@@ -636,7 +644,6 @@ def make_session_with_profile(
     except Exception as exc:
         msg = str(exc)
         if "DeformConv" in msg or "NOT_IMPLEMENTED" in msg or "No Op registered" in msg:
-            ort_ver = getattr(ort, "__version__", "unknown")
             raise RuntimeError(
                 "Failed to load the ONNX model. This model contains ONNX DeformConv. "
                 f"Installed onnxruntime=={ort_ver} does not support this model; use ORT 1.25+ or "

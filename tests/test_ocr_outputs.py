@@ -272,6 +272,71 @@ class OcrOutputTest(unittest.TestCase):
             ocr._track_write_future(failing, FakeFuture("x", fail=True), limit=2)
             ocr._track_write_future(failing, FakeFuture("y"), limit=2)
 
+    def test_run_ocr_on_image_array_skips_markdown_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img = np.full((120, 160, 3), 255, dtype=np.uint8)
+            with patch.object(
+                ocr, "build_markdown_text_from_page", return_value="MD"
+            ) as mock_md:
+                res_skipped = ocr._run_ocr_on_image_array(
+                    detector=_StubDetector(),
+                    recognizer30=_StubRecognizer("TESTLINE"),
+                    recognizer50=_StubRecognizer("TESTLINE"),
+                    recognizer100=_StubRecognizer("TESTLINE"),
+                    inputname="page.png",
+                    img=img,
+                    outputpath=tmpdir,
+                    save_viz=False,
+                    include_markdown=False,
+                )
+                mock_md.assert_not_called()
+                self.assertEqual(res_skipped["markdown_text"], "")
+
+                res_default = ocr._run_ocr_on_image_array(
+                    detector=_StubDetector(),
+                    recognizer30=_StubRecognizer("TESTLINE"),
+                    recognizer50=_StubRecognizer("TESTLINE"),
+                    recognizer100=_StubRecognizer("TESTLINE"),
+                    inputname="page.png",
+                    img=img,
+                    outputpath=tmpdir,
+                    save_viz=False,
+                )
+                mock_md.assert_called_once()
+                self.assertEqual(res_default["markdown_text"], "MD")
+
+    def test_initialize_ocr_models_parallel_and_gpu_only_warmup(self):
+        from types import SimpleNamespace
+
+        class FakeModel:
+            def __init__(self, backend):
+                self.backend_profile = SimpleNamespace(active_backend=backend)
+                self.warmup_calls = 0
+
+            def warmup(self):
+                self.warmup_calls += 1
+
+        args = _make_args("/tmp/out", device="cpu")
+        cpu_det = FakeModel("cpu")
+        cpu_recs = [FakeModel("cpu"), FakeModel("cpu"), FakeModel("cpu")]
+        with patch.object(ocr, "get_detector", return_value=cpu_det) as gd, patch.object(
+            ocr, "get_recognizer", side_effect=cpu_recs
+        ) as gr, patch.object(ocr, "prepare_backend_for_parallel_init") as prep:
+            models_cpu = ocr.initialize_ocr_models(args)
+        prep.assert_called_once_with("cpu")
+        self.assertEqual(gd.call_count, 1)
+        self.assertEqual(gr.call_count, 3)
+        self.assertEqual(sum(m.warmup_calls for m in models_cpu), 0)
+
+        args_cuda = _make_args("/tmp/out", device="cuda")
+        cuda_det = FakeModel("cuda")
+        cuda_recs = [FakeModel("cuda"), FakeModel("cuda"), FakeModel("cuda")]
+        with patch.object(ocr, "get_detector", return_value=cuda_det), patch.object(
+            ocr, "get_recognizer", side_effect=cuda_recs
+        ), patch.object(ocr, "prepare_backend_for_parallel_init"):
+            models_cuda = ocr.initialize_ocr_models(args_cuda)
+        self.assertTrue(all(m.warmup_calls == 1 for m in models_cuda))
+
 
 class PdfRobustnessTest(unittest.TestCase):
     """Unopenable or empty PDFs must be skipped, not abort the whole batch."""

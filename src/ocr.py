@@ -21,7 +21,14 @@ from functools import lru_cache
 from reading_order.xy_cut.eval import eval_xml
 from reading_order.xy_cut.block_xy_cut import solve as solve_reading_order
 from ndl_parser import convert_to_xml_string3, name_to_org_name
-from ort_provider import DEVICE_CHOICES, format_device_diagnostics
+from ort_provider import (
+    DEVICE_CHOICES,
+    PRECISION_CHOICES,
+    _emit_warning_once,
+    format_device_diagnostics,
+    prepare_backend_for_parallel_init,
+    should_parallelize_model_init,
+)
 from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
 from version import __version__
 
@@ -912,6 +919,7 @@ def get_recognizer(args,weights_path=None):
         device_id=getattr(args, "device_id", 0),
         batch_size=getattr(args, "batch_size", 0),
         strict_device=getattr(args, "strict_device", False),
+        precision=getattr(args, "precision", "fp32"),
     )
     if getattr(args, 'enable_tcy', False):
         from tcy_wrapper import TateChuYokoWrapper
@@ -919,6 +927,58 @@ def get_recognizer(args,weights_path=None):
             recognizer, **_build_tcy_wrapper_kwargs(args)
         )
     return recognizer
+
+
+def _warmup_gpu_model(model):
+    profile = getattr(model, "backend_profile", None)
+    active_backend = getattr(profile, "active_backend", "cpu") if profile is not None else "cpu"
+    if active_backend != "cpu":
+        warmup_fn = getattr(model, "warmup", None)
+        if callable(warmup_fn):
+            try:
+                warmup_fn()
+            except Exception as exc:
+                _emit_warning_once(
+                    ("warmup", active_backend, type(model).__name__),
+                    f"[WARN] GPU warm-up skipped for {type(model).__name__} on {active_backend}: {exc}",
+                )
+    return model
+
+
+def initialize_ocr_models(args, *, warmup: bool = True):
+    """Create the four OCR sessions (parallelized on CPU/CUDA) and warm up GPU sessions."""
+    rec_classes = getattr(args, "rec_classes", None)
+    if rec_classes and os.path.isfile(rec_classes):
+        _load_charlist(os.path.abspath(rec_classes))
+
+    effective_device = getattr(args, "device", None) or "auto"
+    prepare_backend_for_parallel_init(effective_device)
+
+    def _build_and_warmup(factory, *f_args, **f_kwargs):
+        model = factory(*f_args, **f_kwargs)
+        return _warmup_gpu_model(model) if warmup else model
+
+    def _build_recognizer_attr(attr_name: str):
+        return _build_and_warmup(get_recognizer, args, weights_path=getattr(args, attr_name))
+
+    if should_parallelize_model_init(effective_device):
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="model-init") as executor:
+            det_future = executor.submit(_build_and_warmup, get_detector, args)
+            rec100_future = executor.submit(_build_and_warmup, get_recognizer, args)
+            rec30_future = executor.submit(_build_recognizer_attr, "rec_weights30")
+            rec50_future = executor.submit(_build_recognizer_attr, "rec_weights50")
+            return (
+                det_future.result(),
+                rec100_future.result(),
+                rec30_future.result(),
+                rec50_future.result(),
+            )
+
+    detector = _build_and_warmup(get_detector, args)
+    recognizer100 = _build_and_warmup(get_recognizer, args)
+    recognizer30 = _build_recognizer_attr("rec_weights30")
+    recognizer50 = _build_recognizer_attr("rec_weights50")
+    return detector, recognizer100, recognizer30, recognizer50
 
 def inference_on_detector(args,inputname:str,npimage:np.ndarray,outputpath:str,issaveimg:bool=True):
     print("[INFO] Intialize Model")
@@ -969,6 +1029,7 @@ def _run_ocr_on_image_array(
     save_viz: bool = False,
     text_transform=None,
     preprocessed_det=None,
+    include_markdown: bool = True,
 ):
     img_h, img_w = img.shape[:2]
     detections, classeslist = process_detector(
@@ -1098,9 +1159,13 @@ def _run_ocr_on_image_array(
     markdown_styles = _normalize_markdown_styles(
         getattr(detector, "markdown_styles", None)
     )
-    markdown_text = build_markdown_text_from_page(
-        page_elem,
-        markdown_styles=markdown_styles,
+    markdown_text = (
+        build_markdown_text_from_page(
+            page_elem,
+            markdown_styles=markdown_styles,
+        )
+        if include_markdown
+        else ""
     )
     return {
         "page_xml": page_xml,
@@ -1611,10 +1676,7 @@ def process_pdf_documents(args, pdf_paths: list[str]):
         return None
 
     print("[INFO] Intialize Model")
-    detector = get_detector(args)
-    recognizer100 = get_recognizer(args=args)
-    recognizer30 = get_recognizer(args=args, weights_path=args.rec_weights30)
-    recognizer50 = get_recognizer(args=args, weights_path=args.rec_weights50)
+    detector, recognizer100, recognizer30, recognizer50 = initialize_ocr_models(args)
 
     render_dpi = _sanitize_pdf_render_dpi(getattr(args, "pdf_render_dpi", 150.0))
     render_scale = render_dpi / 72.0
@@ -1698,6 +1760,7 @@ def process_pdf_documents(args, pdf_paths: list[str]):
                         outputpath=args.output,
                         save_viz=args.viz,
                         preprocessed_det=det_pre,
+                        include_markdown=False,
                     )
                     page_results.append(page_result)
                     all_json_contents.append(page_result["json_lines"])
@@ -1810,10 +1873,7 @@ def process(args):
         recognizer30 = models["recognizer30"]
         recognizer50 = models["recognizer50"]
     else:
-        detector=get_detector(args)
-        recognizer100=get_recognizer(args=args)
-        recognizer30=get_recognizer(args=args,weights_path=args.rec_weights30)
-        recognizer50=get_recognizer(args=args,weights_path=args.rec_weights50)
+        detector, recognizer100, recognizer30, recognizer50 = initialize_ocr_models(args)
     tatelinecnt=0
     alllinecnt=0
 
@@ -2014,6 +2074,14 @@ def main(download_models=False):
     )
     parser.add_argument("--device-id", type=int, required=False, default=0, help="GPU device/adapter index")
     parser.add_argument("--batch-size", type=int, required=False, default=0, help="PARSeq batch size (0 for automatic per backend)")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        required=False,
+        choices=list(PRECISION_CHOICES),
+        default="fp32",
+        help="PARSeq inference precision (fp32: exact default; fp16: approximate fast/low-VRAM mixed-precision for GPU)",
+    )
     parser.add_argument("--strict-device", action="store_true", default=False, help="Fail instead of falling back to CPU if the requested GPU backend fails")
     parser.add_argument("--check-device", action="store_true", default=False, help="Print available GPU execution providers and exit")
     parser.add_argument("--enable-tcy", action="store_true", dest="enable_tcy", default=False, help="Enable tate-chuu-yoko (縦中横) detection for vertical text (e.g. newspaper OCR)")

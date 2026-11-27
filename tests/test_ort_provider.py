@@ -19,6 +19,10 @@ BUNDLED_PARSEQ30 = ROOT / "src" / "model" / "parseq-ndl-24x256-30-tiny-499epoch-
 class OrtProviderTest(unittest.TestCase):
     def setUp(self):
         ort_provider._WARNED_KEYS.clear()
+        ort_provider._CUDA_DLLS_PRELOADED = False
+        ort_provider._CUDA_DLLS_ERROR = None
+        ort_provider._CUDA_PRELOAD_OUTPUT = None
+        ort_provider._CUDA_PROBE_CACHE = None
 
     def test_choices_priority_and_normalization(self):
         self.assertIn("auto", ort_provider.DEVICE_CHOICES)
@@ -39,8 +43,33 @@ class OrtProviderTest(unittest.TestCase):
 
     def test_parallel_model_init_policy(self):
         self.assertTrue(ort_provider.should_parallelize_model_init("cpu"))
-        for dev in ("auto", "cuda", "migraphx", "rocm", "openvino", "webgpu", "dml"):
+        self.assertTrue(ort_provider.should_parallelize_model_init("cuda"))
+        for dev in ("migraphx", "rocm", "openvino", "webgpu", "dml"):
             self.assertFalse(ort_provider.should_parallelize_model_init(dev))
+        with patch.object(ort_provider, "resolve_auto_backend_name", return_value="cuda"):
+            self.assertTrue(ort_provider.should_parallelize_model_init("auto"))
+        with patch.object(ort_provider, "resolve_auto_backend_name", return_value="cpu"):
+            self.assertTrue(ort_provider.should_parallelize_model_init("auto"))
+        with patch.object(ort_provider, "resolve_auto_backend_name", return_value="webgpu"):
+            self.assertFalse(ort_provider.should_parallelize_model_init("auto"))
+
+    def test_precision_normalization_and_cuda_defaults(self):
+        self.assertEqual(ort_provider.PRECISION_CHOICES, ("fp32", "fp16"))
+        self.assertEqual(ort_provider.normalize_precision_name(None), "fp32")
+        self.assertEqual(ort_provider.normalize_precision_name(""), "fp32")
+        self.assertEqual(ort_provider.normalize_precision_name("FLOAT32"), "fp32")
+        self.assertEqual(ort_provider.normalize_precision_name("fp16"), "fp16")
+        self.assertEqual(ort_provider.normalize_precision_name(" Float16 "), "fp16")
+        self.assertEqual(ort_provider.normalize_precision_name("half"), "fp16")
+        self.assertEqual(ort_provider.normalize_precision_name("int8"), "int8")
+        self.assertEqual(ort_provider._DEFAULT_BATCH_SIZES["cuda"], 64)
+
+        with patch.object(ort_provider, "preload_cuda_dlls_if_needed") as preload, patch.object(
+            ort_provider, "register_plugin_eps"
+        ) as register:
+            ort_provider.prepare_backend_for_parallel_init("cuda")
+        preload.assert_called_once_with()
+        register.assert_called_once_with()
 
     def test_openvino_cpu_only_ep_device_not_treated_as_gpu(self):
         ov_cpu = SimpleNamespace(
@@ -261,6 +290,9 @@ class OrtProviderTest(unittest.TestCase):
                 enable_mem_reuse=False,
             )
         self.assertEqual(profile.active_backend, "cuda")
+        self.assertEqual(profile.default_batch_size, 64)
+        self.assertTrue(profile.parallel_session_init)
+        self.assertFalse(profile.concurrent_session_run)
         self.assertFalse(captured["opt"].enable_mem_reuse)
         self.assertEqual(
             captured["providers"][0],
@@ -399,6 +431,166 @@ class OrtProviderTest(unittest.TestCase):
                 model_label="PARSEQ(rec30)",
             )
             self.assertEqual(parseq_profile.active_backend, "dml")
+
+    def test_normalize_helpers_handle_non_string_inputs(self):
+        self.assertEqual(ort_provider.normalize_precision_name(123), "fp32")
+        self.assertEqual(ort_provider.normalize_precision_name(None), "fp32")
+        self.assertEqual(ort_provider.normalize_precision_name("FLOAT16"), "fp16")
+        self.assertEqual(ort_provider.normalize_device_name(123), "auto")
+        self.assertEqual(ort_provider.normalize_device_name(None), "auto")
+
+    def test_cuda_backend_preloads_dlls_before_snapshotting_providers(self):
+        state = {"preloaded": False}
+
+        def fake_preload():
+            state["preloaded"] = True
+
+        def fake_providers():
+            if state["preloaded"]:
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            return ["CPUExecutionProvider"]
+
+        class _FakeCudaSess:
+            def __init__(self, path, sess_options=None, providers=None):
+                pass
+
+            def get_providers(self):
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        with patch.object(
+            ort_provider, "preload_cuda_dlls_if_needed", side_effect=fake_preload
+        ), patch.object(
+            ort_provider.ort, "get_available_providers", side_effect=fake_providers
+        ), patch.object(
+            ort_provider.ort, "InferenceSession", side_effect=_FakeCudaSess
+        ):
+            _, profile = ort_provider.create_inference_session(
+                "model.onnx", device="cuda", strict_device=True
+            )
+        self.assertTrue(state["preloaded"])
+        self.assertEqual(profile.active_backend, "cuda")
+
+    def test_detect_available_backends_separates_declared_verified_and_missing_runtime(self):
+        with patch.object(ort_provider, "preload_cuda_dlls_if_needed"), patch.object(
+            ort_provider, "register_plugin_eps", return_value={}
+        ), patch.object(
+            ort_provider.ort,
+            "get_available_providers",
+            return_value=["CUDAExecutionProvider", "MIGraphXExecutionProvider", "CPUExecutionProvider"],
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[]
+        ):
+            missing_probe = {
+                "declared": True,
+                "provider_present": True,
+                "expected_cuda_major": "13",
+                "runtime_ready": False,
+                "missing_libs": ["cudart64_13.dll", "cudnn64_9.dll"],
+                "detected_other_cuda_major": "12",
+                "detail": "CUDA 13 ランタイム / cuDNN 9 不足: cudart64_13.dll, cudnn64_9.dll",
+                "hint": "CUDA Toolkit 13.x を導入してください",
+            }
+            with patch.object(ort_provider, "probe_cuda_runtime", return_value=missing_probe):
+                avail_missing = ort_provider.detect_available_backends(refresh=True)
+            self.assertFalse(avail_missing["cuda"]["available"])
+            self.assertTrue(avail_missing["cuda"]["declared"])
+            self.assertFalse(avail_missing["cuda"]["verified"])
+            self.assertEqual(avail_missing["cuda"]["status"], "missing_runtime")
+            self.assertEqual(avail_missing["cuda"]["missing_libs"], ["cudart64_13.dll", "cudnn64_9.dll"])
+            self.assertTrue(avail_missing["migraphx"]["available"])
+            self.assertEqual(avail_missing["migraphx"]["status"], "declared_only")
+            self.assertIsNone(avail_missing["migraphx"]["verified"])
+            self.assertEqual(avail_missing["cpu"]["status"], "verified")
+
+            ready_probe = {
+                "declared": True,
+                "provider_present": True,
+                "expected_cuda_major": "13",
+                "runtime_ready": True,
+                "missing_libs": [],
+                "detected_other_cuda_major": None,
+                "detail": "CUDAExecutionProvider (CUDA 13 + cuDNN 9 verified)",
+                "hint": "",
+            }
+            with patch.object(ort_provider, "probe_cuda_runtime", return_value=ready_probe):
+                avail_ready = ort_provider.detect_available_backends(refresh=True)
+            self.assertTrue(avail_ready["cuda"]["available"])
+            self.assertTrue(avail_ready["cuda"]["verified"])
+            self.assertEqual(avail_ready["cuda"]["status"], "verified")
+
+    def test_auto_device_records_missing_cuda_runtime_as_fallback_warning_and_strict_error(self):
+        availability = {
+            "cuda": {
+                "available": False,
+                "declared": True,
+                "verified": False,
+                "status": "missing_runtime",
+                "mode": "monolithic",
+                "devices": ["CUDAExecutionProvider"],
+                "detail": "CUDA 13 ランタイム / cuDNN 9 不足: cudart64_13.dll（システムには CUDA 12 のみ検出）",
+                "hint": "CUDA Toolkit 13.x と cuDNN 9.x を導入してください",
+            },
+            "migraphx": {"available": False, "status": "unavailable", "mode": "none", "devices": [], "detail": ""},
+            "rocm": {"available": False, "status": "unavailable", "mode": "none", "devices": [], "detail": ""},
+            "openvino": {"available": False, "status": "unavailable", "mode": "none", "devices": [], "detail": ""},
+            "webgpu": {"available": False, "status": "unavailable", "mode": "none", "devices": [], "detail": ""},
+            "dml": {"available": False, "status": "unavailable", "mode": "none", "devices": [], "detail": ""},
+            "cpu": {"available": True, "status": "verified", "mode": "builtin", "devices": ["CPU"], "detail": "CPUExecutionProvider"},
+        }
+        stderr = io.StringIO()
+        with patch.object(ort_provider, "detect_available_backends", return_value=availability), patch.object(
+            ort_provider,
+            "_create_session_for_backend",
+            return_value=(object(), ["CPUExecutionProvider"]),
+        ) as create_backend, contextlib.redirect_stderr(stderr):
+            _, profile = ort_provider.create_inference_session(
+                "model.onnx", device="auto", strict_device=False, model_label="DEIM"
+            )
+        create_backend.assert_called_once()
+        self.assertEqual(profile.active_backend, "cpu")
+        self.assertTrue(profile.fallback_occurred)
+        self.assertIsNotNone(profile.warning_message)
+        self.assertIn("cudart64_13.dll", profile.warning_message)
+        self.assertIn("対処法:", profile.warning_message)
+
+        with patch.object(ort_provider, "detect_available_backends", return_value=availability):
+            with self.assertRaisesRegex(RuntimeError, "cudart64_13\\.dll"):
+                ort_provider.create_inference_session(
+                    "model.onnx", device="auto", strict_device=True, model_label="DEIM"
+                )
+
+    def test_format_device_diagnostics_reports_missing_cuda_runtime_and_cuda12_mismatch(self):
+        def fake_can_load(filename, candidate_paths):
+            if filename == "cudart64_12.dll":
+                return True, None
+            return False, "DLL not found"
+
+        with patch.object(ort_provider.sys, "platform", "win32"), patch.object(
+            ort_provider, "preload_cuda_dlls_if_needed"
+        ), patch.object(
+            ort_provider, "register_plugin_eps", return_value={}
+        ), patch.object(
+            ort_provider.ort, "get_available_providers", return_value=["CPUExecutionProvider"]
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[]
+        ), patch.object(
+            ort_provider,
+            "_bundled_cuda_provider_path",
+            return_value=Path("/fake/site-packages/onnxruntime/capi/onnxruntime_providers_cuda.dll"),
+        ), patch.object(
+            ort_provider.ort, "cuda_version", "13.0", create=True
+        ), patch.object(
+            ort_provider, "_can_load_shared_lib", side_effect=fake_can_load
+        ):
+            report = ort_provider.format_device_diagnostics(refresh=True)
+
+        self.assertIn("MISSING RUNTIME (declared)", report)
+        self.assertNotIn("cuda     : READY", report)
+        self.assertIn("CUDA runtime preflight:", report)
+        self.assertIn("cudart64_13.dll", report)
+        self.assertIn("cudnn64_9.dll", report)
+        self.assertIn("CUDA 12 detected", report)
+        self.assertIn("Selected by '--device auto': cpu", report)
 
 
 if __name__ == "__main__":

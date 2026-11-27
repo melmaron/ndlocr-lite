@@ -1,5 +1,5 @@
 import logging
-# logging.basicConfig(filename='debug.log', encoding='utf-8', level=logging.DEBUG)
+from logging.handlers import RotatingFileHandler
 import asyncio
 import inspect
 import flet as ft
@@ -7,6 +7,8 @@ from typing import List, Dict, Tuple
 import sys
 import os
 from pathlib import Path
+import platform
+import subprocess
 import threading
 
 APP_DIR = Path(__file__).resolve().parent
@@ -44,8 +46,13 @@ from collections import Counter
 from optional_features import load_optional_features
 from ort_provider import (
     DEVICE_CHOICES,
+    PRECISION_CHOICES,
     detect_available_backends,
+    format_device_diagnostics,
     normalize_device_name,
+    normalize_precision_name,
+    ort_supports_deform_conv,
+    prepare_backend_for_parallel_init,
     should_parallelize_model_init,
 )
 from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
@@ -172,10 +179,23 @@ async def open_preview_link(event):
 
     url = str(event.data)
     parsed = urlparse(url)
-    if parsed.scheme == 'file' and sys.platform == 'win32':
+    if parsed.scheme == 'file':
         path = ('//' + parsed.netloc if parsed.netloc else '') + parsed.path
-        await asyncio.to_thread(os.startfile, url2pathname(path))
-    elif not await asyncio.to_thread(webbrowser.open, url):
+        local_path = url2pathname(path)
+        if sys.platform == 'win32':
+            await asyncio.to_thread(os.startfile, local_path)
+            return
+        if sys.platform == 'darwin':
+            await asyncio.to_thread(subprocess.run, ['open', local_path], check=True)
+            return
+        try:
+            await asyncio.to_thread(subprocess.run, ['xdg-open', local_path], check=True)
+            return
+        except (FileNotFoundError, subprocess.SubprocessError):
+            if not await asyncio.to_thread(webbrowser.open, url):
+                raise OSError(f'Unable to open preview link: {url}')
+            return
+    if not await asyncio.to_thread(webbrowser.open, url):
         raise OSError(f'Unable to open preview link: {url}')
 
 
@@ -254,6 +274,57 @@ APP_TEMP_DIR = Path(
 ).resolve()
 PDFTMPPATH = str(APP_TEMP_DIR / '4ab7ecc3-53fb-b3e7-64e8-a809b5a483d2')
 USER_CONFIG_PATH = APP_DATA_DIR / 'userconf.yaml'
+LOGGER = logging.getLogger('ndlocr.gui')
+GUI_LOG_PATH: Path | None = None
+_LOG_HANDLER_ATTR = '_ndlocr_gui_log_path'
+
+
+def configure_gui_logging(log_dir=None, filename: str = 'ndlocr-lite.log') -> Path | None:
+    """Configure persistent rotating file logging for GUI diagnostics and ORT warnings."""
+    global GUI_LOG_PATH
+    candidates = [Path(log_dir)] if log_dir is not None else [APP_DATA_DIR, APP_TEMP_DIR]
+    parent_logger = logging.getLogger('ndlocr')
+    parent_logger.setLevel(logging.INFO)
+    parent_logger.propagate = False
+
+    for candidate_dir in candidates:
+        try:
+            resolved_dir = Path(candidate_dir).resolve()
+            resolved_dir.mkdir(parents=True, exist_ok=True)
+            target_path = resolved_dir / filename
+
+            existing = None
+            for handler in list(parent_logger.handlers):
+                recorded = getattr(handler, _LOG_HANDLER_ATTR, None)
+                if recorded is not None:
+                    if Path(recorded) == target_path:
+                        existing = handler
+                    else:
+                        parent_logger.removeHandler(handler)
+                        try:
+                            handler.close()
+                        except Exception:
+                            pass
+
+            if existing is None:
+                handler = RotatingFileHandler(
+                    target_path,
+                    maxBytes=2 * 1024 * 1024,
+                    backupCount=3,
+                    encoding='utf-8',
+                )
+                handler.setLevel(logging.INFO)
+                handler.setFormatter(
+                    logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+                )
+                setattr(handler, _LOG_HANDLER_ATTR, str(target_path))
+                parent_logger.addHandler(handler)
+
+            GUI_LOG_PATH = target_path
+            return target_path
+        except OSError:
+            continue
+    return None
 
 
 def get_windows_scale_factor():
@@ -265,6 +336,32 @@ def get_windows_scale_factor():
         return dpi / 96.0
     except Exception:
         return 1.0
+
+
+def get_display_scale_factor(page=None) -> float:
+    """Return display scale factor on Windows, macOS, and Linux."""
+    if sys.platform == 'win32':
+        return get_windows_scale_factor()
+    media = getattr(page, 'media', None) if page is not None else None
+    dpr = getattr(media, 'device_pixel_ratio', None)
+    try:
+        if dpr is not None:
+            dpr_val = float(dpr)
+            if math.isfinite(dpr_val) and dpr_val > 0:
+                return dpr_val
+    except (TypeError, ValueError):
+        pass
+    for env_name in ('GDK_SCALE', 'QT_SCALE_FACTOR'):
+        raw = os.environ.get(env_name)
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+            if math.isfinite(val) and val > 0:
+                return val
+        except (TypeError, ValueError):
+            continue
+    return 1.0
 
 
 class RecogLine:
@@ -289,8 +386,28 @@ def process_cascade(alllineobj: RecogLine, recognizer30, recognizer50, recognize
     )
 
 
-def load_ocr_models(args, download_models=False):
-    """Create the four OCR ONNX sessions (sequentially on GPU, concurrently on CPU)."""
+def _warmup_gpu_model(model):
+    profile = getattr(model, 'backend_profile', None)
+    active_backend = getattr(profile, 'active_backend', 'cpu') if profile is not None else 'cpu'
+    if active_backend != 'cpu':
+        warmup_fn = getattr(model, 'warmup', None)
+        if callable(warmup_fn):
+            try:
+                warmup_fn()
+            except Exception as exc:
+                print(
+                    f'[WARN] GPU warm-up skipped for {type(model).__name__} on {active_backend}: {exc}',
+                    file=sys.stderr,
+                )
+    return model
+
+
+def _init_and_warmup_model(factory, *factory_args):
+    return _warmup_gpu_model(factory(*factory_args))
+
+
+def load_ocr_models(args, download_models=False, reuse_detector=None):
+    """Create OCR ONNX sessions (optionally reusing detector when only PARSeq settings change)."""
     if download_models:
         from model_download import resolve_model_paths
 
@@ -300,27 +417,39 @@ def load_ocr_models(args, download_models=False):
         ocr._load_charlist(os.path.abspath(args.rec_classes))
 
     effective_device = getattr(args, 'device', None) or 'auto'
+    prepare_backend_for_parallel_init(effective_device)
     if should_parallelize_model_init(effective_device):
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='model-init') as executor:
-            detector_future = executor.submit(ocr.get_detector, args)
-            recognizer100_future = executor.submit(ocr.get_recognizer, args)
-            recognizer30_future = executor.submit(ocr.get_recognizer, args, args.rec_weights30)
-            recognizer50_future = executor.submit(ocr.get_recognizer, args, args.rec_weights50)
+        workers = 3 if reuse_detector is not None else 4
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='model-init') as executor:
+            detector_future = (
+                None
+                if reuse_detector is not None
+                else executor.submit(_init_and_warmup_model, ocr.get_detector, args)
+            )
+            recognizer100_future = executor.submit(_init_and_warmup_model, ocr.get_recognizer, args)
+            recognizer30_future = executor.submit(_init_and_warmup_model, ocr.get_recognizer, args, args.rec_weights30)
+            recognizer50_future = executor.submit(_init_and_warmup_model, ocr.get_recognizer, args, args.rec_weights50)
+            detector = reuse_detector if reuse_detector is not None else detector_future.result()
             return (
-                detector_future.result(),
+                detector,
                 recognizer100_future.result(),
                 recognizer30_future.result(),
                 recognizer50_future.result(),
             )
 
-    detector = ocr.get_detector(args)
-    recognizer100 = ocr.get_recognizer(args)
-    recognizer30 = ocr.get_recognizer(args, args.rec_weights30)
-    recognizer50 = ocr.get_recognizer(args, args.rec_weights50)
+    detector = reuse_detector if reuse_detector is not None else _init_and_warmup_model(ocr.get_detector, args)
+    recognizer100 = _init_and_warmup_model(ocr.get_recognizer, args)
+    recognizer30 = _init_and_warmup_model(ocr.get_recognizer, args, args.rec_weights30)
+    recognizer50 = _init_and_warmup_model(ocr.get_recognizer, args, args.rec_weights50)
     return detector, recognizer100, recognizer30, recognizer50
 
 
 def load_table_recognizer(args, download_models=False):
+    if TABLE_STRUCTURE_FEATURE is not None and not TABLE_STRUCTURE_FEATURE.is_supported():
+        raise RuntimeError(
+            TABLE_STRUCTURE_FEATURE.unsupported_reason('ja')
+            or 'Table structure estimation is unsupported on this ONNX Runtime version.'
+        )
     if download_models and args.table_weights is None:
         from model_download import get_model_path, TABLE_MODEL
 
@@ -692,7 +821,7 @@ class CaptureTool:
         self.img_str = ''
         self.result_jsonstr = ''
         self.outputdirpath = os.getcwd()
-        self.scale_factor = get_windows_scale_factor()
+        self.scale_factor = get_display_scale_factor(self.page)
         self.start_x = 0
         self.start_y = 0
         self.current_x = 0
@@ -835,7 +964,7 @@ class CaptureTool:
         if self.cboc_fixed.value:
             self._capture_and_restore(self.x1_phys, self.y1_phys, self.x2_phys, self.y2_phys)
             return
-        self.scale_factor = get_windows_scale_factor()
+        self.scale_factor = get_display_scale_factor(self.page)
         self.original_width = self.page.window.width
         self.original_height = self.page.window.height
         self.original_left = self.page.window.left
@@ -1051,6 +1180,14 @@ def parse_gui_args(argv=None, download_models=False):
     )
     parser.add_argument('--device-id', type=int, required=False, default=None, help='GPU device/adapter index')
     parser.add_argument('--batch-size', type=int, required=False, default=None, help='PARSeq batch size (0 for automatic)')
+    parser.add_argument(
+        '--precision',
+        type=str,
+        required=False,
+        choices=list(PRECISION_CHOICES),
+        default=None,
+        help='PARSeq inference precision (fp32 or fp16)',
+    )
     parser.add_argument('--strict-device', action='store_true', default=False, help='Fail instead of falling back to CPU')
     if TABLE_STRUCTURE_FEATURE is not None:
         TABLE_STRUCTURE_FEATURE.add_arguments(parser, SOURCE_DIR)
@@ -1072,6 +1209,7 @@ def resolve_gui_engine_args(args, config_obj, cli_overrides=None):
     device = overrides.get('device') if 'device' in overrides else config_obj.get('device', 'auto')
     device_id = overrides.get('device_id') if 'device_id' in overrides else config_obj.get('device_id', 0)
     batch_size = overrides.get('batch_size') if 'batch_size' in overrides else config_obj.get('batch_size', 0)
+    precision = overrides.get('precision') if 'precision' in overrides else config_obj.get('precision', 'fp32')
 
     if not isinstance(device, str):
         device = 'auto'
@@ -1087,7 +1225,178 @@ def resolve_gui_engine_args(args, config_obj, cli_overrides=None):
         args.batch_size = max(0, int(batch_size))
     except (TypeError, ValueError):
         args.batch_size = 0
+    if not isinstance(precision, str):
+        precision = 'fp32'
+    normalized_precision = normalize_precision_name(precision)
+    if normalized_precision not in PRECISION_CHOICES:
+        normalized_precision = 'fp32'
+    args.precision = normalized_precision
     return args
+
+
+def extract_engine_state(args_obj) -> dict:
+    """Return normalized execution engine configuration fields from an args namespace."""
+    raw_prec = getattr(args_obj, 'precision', 'fp32')
+    norm_prec = normalize_precision_name(raw_prec) if isinstance(raw_prec, str) else 'fp32'
+    if norm_prec not in PRECISION_CHOICES:
+        norm_prec = 'fp32'
+    raw_dev = getattr(args_obj, 'device', 'auto')
+    norm_dev = normalize_device_name(raw_dev) if isinstance(raw_dev, str) else 'auto'
+    if norm_dev not in DEVICE_CHOICES:
+        norm_dev = 'auto'
+    try:
+        device_id = max(0, int(getattr(args_obj, 'device_id', 0) or 0))
+    except (TypeError, ValueError):
+        device_id = 0
+    try:
+        batch_size = max(0, int(getattr(args_obj, 'batch_size', 0) or 0))
+    except (TypeError, ValueError):
+        batch_size = 0
+    return {
+        'device': norm_dev,
+        'device_id': device_id,
+        'batch_size': batch_size,
+        'precision': norm_prec,
+    }
+
+
+def compute_engine_reload_scope(loaded_engine_state, target_engine_state) -> str:
+    """Decide whether a reload needs all models, only PARSeq recognizers, or nothing."""
+    if not loaded_engine_state or not target_engine_state:
+        return 'all'
+    if (
+        loaded_engine_state.get('device') != target_engine_state.get('device')
+        or int(loaded_engine_state.get('device_id', 0)) != int(target_engine_state.get('device_id', 0))
+    ):
+        return 'all'
+    if (
+        int(loaded_engine_state.get('batch_size', 0)) != int(target_engine_state.get('batch_size', 0))
+        or loaded_engine_state.get('precision', 'fp32') != target_engine_state.get('precision', 'fp32')
+    ):
+        return 'recognizers'
+    return 'none'
+
+
+def collect_engine_warnings(
+    detector,
+    recognizer,
+    recognizer30=None,
+    recognizer50=None,
+    table_recognizer=None,
+    table_error=None,
+) -> dict:
+    """Collect deduplicated fallback warnings and table errors from loaded models."""
+    warnings = []
+    fallback_occurred = False
+    for model in (detector, recognizer, recognizer30, recognizer50, table_recognizer):
+        profile = getattr(model, 'backend_profile', None)
+        if profile is None:
+            continue
+        if getattr(profile, 'fallback_occurred', False):
+            fallback_occurred = True
+        msg = getattr(profile, 'warning_message', None)
+        if isinstance(msg, str):
+            cleaned = msg.strip()
+            if cleaned and cleaned not in warnings:
+                warnings.append(cleaned)
+    table_warning = str(table_error).strip() if table_error is not None else None
+    if table_warning == '':
+        table_warning = None
+    return {
+        'fallback_occurred': fallback_occurred,
+        'warnings': warnings,
+        'table_warning': table_warning,
+    }
+
+
+def build_device_dropdown_options(availability: dict, is_ja: bool):
+    """Build Device dropdown options showing verified vs missing-runtime vs unavailable."""
+    device_labels = {
+        'auto': '自動（GPU優先）' if is_ja else 'Auto (Prefer GPU)',
+        'cuda': 'CUDA (NVIDIA)',
+        'openvino': 'OpenVINO (Intel Arc / iGPU)',
+        'webgpu': 'WebGPU (Radeon / Arc / NVIDIA)',
+        'migraphx': 'MIGraphX (Linux Radeon)',
+        'rocm': 'ROCm (Linux Radeon)',
+        'dml': 'DirectML (Windows)',
+        'cpu': 'CPU',
+    }
+    options = []
+    for dev_key in DEVICE_CHOICES:
+        label = device_labels.get(dev_key, dev_key)
+        if dev_key not in ('auto', 'cpu'):
+            info = availability.get(dev_key, {}) if isinstance(availability, dict) else {}
+            ready = bool(info.get('available'))
+            status = info.get('status')
+            if ready:
+                suffix = '利用可能' if is_ja else 'ready'
+            elif status == 'missing_runtime':
+                suffix = 'ランタイム不足' if is_ja else 'missing runtime'
+            else:
+                suffix = '未検出' if is_ja else 'unavailable'
+            label = f'{label} [{suffix}]'
+        options.append(ft.dropdown.Option(key=dev_key, text=label))
+    return options
+
+
+def build_gui_diagnostics_report(
+    detector=None,
+    recognizer=None,
+    recognizer30=None,
+    recognizer50=None,
+    table_recognizer=None,
+    table_error=None,
+    log_path=None,
+    init_error=None,
+    *,
+    refresh: bool = False,
+) -> str:
+    """Build full diagnostics text for the GUI Diagnostics dialog and log."""
+    sections = []
+    if init_error is not None:
+        sections.append(f'Initialization error: {init_error}')
+
+    model_entries = (
+        ('DEIMv2 (detector)', detector),
+        ('PARSeq-100', recognizer),
+        ('PARSeq-30', recognizer30),
+        ('PARSeq-50', recognizer50),
+        ('TableCenterNet', table_recognizer),
+    )
+    active_lines = []
+    for label, model in model_entries:
+        if model is None:
+            continue
+        profile = getattr(model, 'backend_profile', None)
+        if profile is None:
+            active_lines.append(f'  - {label}: loaded (no profile)')
+        else:
+            fb = ' [fallback]' if getattr(profile, 'fallback_occurred', False) else ''
+            active_lines.append(
+                f'  - {label}: {profile.active_backend} ({profile.active_providers}){fb}'
+            )
+    if active_lines:
+        sections.append('Active sessions:\n' + '\n'.join(active_lines))
+
+    warning_info = collect_engine_warnings(
+        detector,
+        recognizer,
+        recognizer30,
+        recognizer50,
+        table_recognizer,
+        table_error=table_error,
+    )
+    if warning_info['warnings']:
+        sections.append('Fallback warnings:\n' + '\n\n'.join(warning_info['warnings']))
+    if warning_info['table_warning']:
+        sections.append(f"TableCenterNet status:\n  {warning_info['table_warning']}")
+
+    effective_log = log_path if log_path is not None else GUI_LOG_PATH
+    if effective_log is not None:
+        sections.append(f'Log file: {effective_log}')
+
+    sections.append(format_device_diagnostics(refresh=refresh))
+    return '\n\n'.join(sections)
 
 
 def format_gui_engine_status(detector, recognizer, langcode='ja'):
@@ -1098,8 +1407,21 @@ def format_gui_engine_status(detector, recognizer, langcode='ja'):
         return TRANSLATIONS['engine_status_loading'][langcode]
     bs = getattr(recognizer, 'batch_size', 1)
     bs_text = f', batch={bs}' if isinstance(bs, int) and bs > 1 else ''
-    fb_text = ' [fallback]' if getattr(profile, 'fallback_occurred', False) else ''
-    return f'{prefix}: {profile.display_name}{bs_text}{fb_text}'
+    prec = getattr(recognizer, 'effective_precision', None)
+    req_prec = getattr(recognizer, 'requested_precision', None)
+    prec_fallback = bool(getattr(recognizer, 'precision_fallback_occurred', False))
+    if isinstance(prec, str) and prec == 'fp16':
+        prec_text = ', fp16 (近似)' if langcode == 'ja' else ', fp16 (approx)'
+    elif prec_fallback or (isinstance(req_prec, str) and req_prec == 'fp16' and prec == 'fp32'):
+        prec_text = ', fp16→fp32'
+    else:
+        prec_text = ''
+    fb_occurred = any(
+        bool(getattr(getattr(m, 'backend_profile', None), 'fallback_occurred', False))
+        for m in (recognizer, detector)
+    )
+    fb_text = ' [fallback]' if fb_occurred else ''
+    return f'{prefix}: {profile.display_name}{bs_text}{prec_text}{fb_text}'
 
 
 
@@ -1189,6 +1511,8 @@ def main(page: ft.Page, args=None, download_models=False):
         cli_overrides['device_id'] = args.device_id
     if getattr(args, 'batch_size', None) is not None:
         cli_overrides['batch_size'] = args.batch_size
+    if getattr(args, 'precision', None) is not None:
+        cli_overrides['precision'] = args.precision
 
     page.title = 'NDLOCR-Lite-GUI v{}'.format(__version__)
     page.theme_mode = ft.ThemeMode.SYSTEM
@@ -1202,9 +1526,24 @@ def main(page: ft.Page, args=None, download_models=False):
         if feature is not None:
             default_config.update(feature.default_config())
     config_obj, config_warning = load_user_config(USER_CONFIG_PATH, default_config)
+    resolve_gui_engine_args(args, config_obj, cli_overrides)
+    log_path = configure_gui_logging()
+    LOGGER.info(
+        'Starting %s v%s | python=%s | platform=%s | app_data_dir=%s | log=%s',
+        name,
+        __version__,
+        platform.python_version(),
+        platform.platform(),
+        APP_DATA_DIR,
+        log_path,
+    )
     if config_warning:
         print(f'[WARN] {config_warning}')
-    resolve_gui_engine_args(args, config_obj, cli_overrides)
+        LOGGER.warning('%s', config_warning)
+    try:
+        LOGGER.info('Startup device diagnostics:\n%s', format_device_diagnostics())
+    except Exception as diag_exc:
+        LOGGER.warning('Startup device diagnostics failed: %s', diag_exc)
 
     page.locale_configuration = ft.LocaleConfiguration(
         supported_locales=[
@@ -1239,7 +1578,15 @@ def main(page: ft.Page, args=None, download_models=False):
     origin_recognizer30 = None
     origin_recognizer50 = None
     origin_table_recognizer = None
-    model_state = {'loading': False, 'error': None, 'table_error': None, 'elapsed': None}
+    loaded_engine_state = None
+    model_state = {
+        'loading': False,
+        'error': None,
+        'table_error': None,
+        'elapsed': None,
+        'reload_scope': 'all',
+        'banner_dismissed': False,
+    }
     busy_tracker = BusyTracker()
     pending_engine_reload = {'pending': False}
 
@@ -1256,6 +1603,7 @@ def main(page: ft.Page, args=None, download_models=False):
         ocr_cancel_event=threading.Event()
         pdf_job_list = []
         datapool_batch_extension = None
+        capture_tool = None
         main_interaction_sections = []
         model_loading_handlers = []
 
@@ -1417,29 +1765,34 @@ def main(page: ft.Page, args=None, download_models=False):
             stop_ocr_btn.disabled=not (flag and allow_ocr_cancel)
             if chkbx_table_structure is not None:
                 chkbx_table_structure.disabled = flag or origin_table_recognizer is None
+            if capture_tool is not None and capture_tool.cb_table_structure is not None:
+                capture_tool.cb_table_structure.disabled = flag or origin_table_recognizer is None
             if datapool_batch_extension is not None:
                 datapool_batch_extension.set_external_busy(flag)
 
         def start_engine_reload():
-            nonlocal origin_detector, origin_recognizer
-            nonlocal origin_recognizer30, origin_recognizer50
-            nonlocal origin_table_recognizer
             if model_state['loading'] or busy_tracker.active:
                 # Never swap sessions under a running OCR task; reload once it ends.
                 pending_engine_reload['pending'] = True
                 return
             resolve_gui_engine_args(args, config_obj, cli_overrides)
-            origin_detector = None
-            origin_recognizer = None
-            origin_recognizer30 = None
-            origin_recognizer50 = None
-            origin_table_recognizer = None
+            target_state = extract_engine_state(args)
+            active_baseline = loaded_engine_state if models_are_ready() else None
+            reload_scope = compute_engine_reload_scope(active_baseline, target_state)
+            if models_are_ready() and reload_scope == 'none':
+                model_state['error'] = None
+                refresh_engine_status_ui()
+                page.update()
+                return
+            model_state['reload_scope'] = reload_scope
             model_state['error'] = None
+            model_state['banner_dismissed'] = False
             model_state['loading'] = True
             set_model_loading_lock(True)
             parts_control(True)
             progressbar.value = None
             engine_status_text.value = TRANSLATIONS['engine_status_loading'][config_obj['langcode']]
+            engine_warning_banner.visible = False
             if config_obj['langcode'] == 'ja':
                 set_progress_message('OCRモデルを再読み込み中…')
             else:
@@ -2159,11 +2512,26 @@ def main(page: ft.Page, args=None, download_models=False):
                 new_device_id = max(0, int(device_id_textfield.value or 0))
             except (TypeError, ValueError):
                 new_device_id = 0
+            raw_precision = dropdown_precision.value if isinstance(dropdown_precision.value, str) else 'fp32'
+            new_precision = normalize_precision_name(raw_precision)
+            if new_precision not in PRECISION_CHOICES:
+                new_precision = 'fp32'
 
+            target_state = {
+                'device': new_device,
+                'batch_size': new_batch_size,
+                'device_id': new_device_id,
+                'precision': new_precision,
+            }
+            baseline_state = (
+                loaded_engine_state
+                if loaded_engine_state is not None
+                else extract_engine_state(args)
+            )
             engine_changed = (
-                new_device != args.device
-                or new_batch_size != int(getattr(args, 'batch_size', 0))
-                or new_device_id != int(getattr(args, 'device_id', 0))
+                not models_are_ready()
+                or loaded_engine_state is None
+                or target_state != loaded_engine_state
             )
 
             updated_config = {
@@ -2183,8 +2551,11 @@ def main(page: ft.Page, args=None, download_models=False):
                 'device': new_device,
                 'batch_size': new_batch_size,
                 'device_id': new_device_id,
+                'precision': new_precision,
             }
-            if chkbx_table_structure is not None:
+            if chkbx_table_structure is not None and (
+                TABLE_STRUCTURE_FEATURE is None or TABLE_STRUCTURE_FEATURE.is_supported()
+            ):
                 updated_config['table_structure'] = chkbx_table_structure.value
             config_obj.update(updated_config)
             save_config()
@@ -2194,18 +2565,12 @@ def main(page: ft.Page, args=None, download_models=False):
             if engine_changed:
                 drop_changed_cli_overrides(
                     cli_overrides,
-                    {
-                        'device': args.device,
-                        'batch_size': int(getattr(args, 'batch_size', 0)),
-                        'device_id': int(getattr(args, 'device_id', 0)),
-                    },
-                    {
-                        'device': new_device,
-                        'batch_size': new_batch_size,
-                        'device_id': new_device_id,
-                    },
+                    baseline_state,
+                    target_state,
                 )
                 start_engine_reload()
+            else:
+                resolve_gui_engine_args(args, config_obj, cli_overrides)
 
         def change_pdfstatus(e):
             chkbx_pdf_viztxt.disabled = not chkbx_pdf.value
@@ -2285,7 +2650,8 @@ def main(page: ft.Page, args=None, download_models=False):
         )
 
         file_picker = ft.FilePicker()
-        page.services.append(file_picker)
+        clipboard = ft.Clipboard()
+        page.services.extend([file_picker, clipboard])
         progressbar = ft.ProgressBar(
             width=200,
             value=0,
@@ -2338,26 +2704,17 @@ def main(page: ft.Page, args=None, download_models=False):
             if TABLE_STRUCTURE_FEATURE is not None
             else None
         )
+        table_structure_notice_text = ft.Text(
+            '',
+            size=11,
+            color=ft.Colors.AMBER_800,
+            visible=False,
+            selectable=True,
+            key='table_structure_notice_text',
+        )
         backend_availability = detect_available_backends()
         is_ja = config_obj['langcode'] == 'ja'
-        device_labels = {
-            'auto': '自動（GPU優先）' if is_ja else 'Auto (Prefer GPU)',
-            'cuda': 'CUDA (NVIDIA)',
-            'openvino': 'OpenVINO (Intel Arc / iGPU)',
-            'webgpu': 'WebGPU (Radeon / Arc / NVIDIA)',
-            'migraphx': 'MIGraphX (Linux Radeon)',
-            'rocm': 'ROCm (Linux Radeon)',
-            'dml': 'DirectML (Windows)',
-            'cpu': 'CPU',
-        }
-        device_options = []
-        for dev_key in DEVICE_CHOICES:
-            label = device_labels.get(dev_key, dev_key)
-            if dev_key not in ('auto', 'cpu'):
-                ready = bool(backend_availability.get(dev_key, {}).get('available'))
-                suffix = '利用可能' if (ready and is_ja) else ('ready' if ready else ('未検出' if is_ja else 'unavailable'))
-                label = f'{label} [{suffix}]'
-            device_options.append(ft.dropdown.Option(key=dev_key, text=label))
+        device_options = build_device_dropdown_options(backend_availability, is_ja)
 
         current_device_val = normalize_device_name(args.device)
         if current_device_val not in DEVICE_CHOICES:
@@ -2397,6 +2754,31 @@ def main(page: ft.Page, args=None, download_models=False):
             dense=True,
             key='settings_device_id',
         )
+        precision_options = [
+            ft.dropdown.Option(
+                key='fp32',
+                text='FP32（標準・高精度）' if is_ja else 'FP32 (Default, Exact)',
+            ),
+            ft.dropdown.Option(
+                key='fp16',
+                text='FP16（高速・省VRAM / 近似精度）' if is_ja else 'FP16 (Fast, Low VRAM / Approx.)',
+            ),
+        ]
+        current_precision_val = normalize_precision_name(
+            getattr(args, 'precision', 'fp32')
+            if isinstance(getattr(args, 'precision', 'fp32'), str)
+            else 'fp32'
+        )
+        if current_precision_val not in PRECISION_CHOICES:
+            current_precision_val = 'fp32'
+        dropdown_precision = ft.Dropdown(
+            label=TRANSLATIONS['customize_precision_label'][config_obj['langcode']],
+            value=current_precision_val,
+            options=precision_options,
+            width=290,
+            dense=True,
+            key='settings_precision',
+        )
         engine_status_text = ft.Text(
             format_gui_engine_status(origin_detector, origin_recognizer, config_obj['langcode']),
             size=12,
@@ -2404,6 +2786,209 @@ def main(page: ft.Page, args=None, download_models=False):
             selectable=True,
             key='engine_status_text',
         )
+        engine_warning_text = ft.Text(
+            '',
+            size=12,
+            color=ft.Colors.GREY_900,
+            expand=True,
+            selectable=True,
+            key='engine_warning_text',
+        )
+
+        def build_current_diagnostics_text(refresh: bool = False) -> str:
+            return build_gui_diagnostics_report(
+                detector=origin_detector,
+                recognizer=origin_recognizer,
+                recognizer30=origin_recognizer30,
+                recognizer50=origin_recognizer50,
+                table_recognizer=origin_table_recognizer,
+                table_error=model_state.get('table_error'),
+                log_path=GUI_LOG_PATH,
+                init_error=model_state.get('error'),
+                refresh=refresh,
+            )
+
+        def show_diagnostics_dialog(e=None):
+            diag_body = ft.Text(
+                build_current_diagnostics_text(refresh=True),
+                size=12,
+                font_family='monospace',
+                selectable=True,
+                key='diagnostics_report_text',
+            )
+            diag_copy_status = ft.Text('', size=12, color=ft.Colors.GREEN_700)
+
+            def refresh_diag(_):
+                diag_body.value = build_current_diagnostics_text(refresh=True)
+                diag_copy_status.value = ''
+                refresh_engine_status_ui()
+                page.update()
+
+            async def copy_diag(_):
+                try:
+                    await clipboard.set(diag_body.value or '')
+                    diag_copy_status.value = TRANSLATIONS['engine_diagnostics_copied'][config_obj['langcode']]
+                except Exception as exc:
+                    diag_copy_status.value = f'Copy failed: {exc}'
+                page.update()
+
+            def close_diag(_):
+                if diag_modal.open:
+                    page.pop_dialog()
+
+            diag_modal = ft.AlertDialog(
+                modal=True,
+                title=ft.Row(
+                    controls=[
+                        ft.Icon(ft.Icons.MONITOR_HEART, color=ft.Colors.PRIMARY),
+                        ft.Text(TRANSLATIONS['engine_diagnostics_title'][config_obj['langcode']]),
+                    ],
+                    spacing=8,
+                ),
+                content=ft.Column(
+                    controls=[
+                        diag_copy_status,
+                        ft.Container(
+                            content=ft.Column(
+                                controls=[diag_body],
+                                scroll=ft.ScrollMode.AUTO,
+                            ),
+                            width=760,
+                            height=420,
+                            padding=10,
+                            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+                            border_radius=8,
+                        ),
+                    ],
+                    tight=True,
+                    spacing=6,
+                ),
+                actions=[
+                    ft.TextButton(
+                        TRANSLATIONS['engine_diagnostics_refresh'][config_obj['langcode']],
+                        on_click=refresh_diag,
+                        key='diagnostics_refresh_btn',
+                    ),
+                    ft.TextButton(
+                        TRANSLATIONS['engine_diagnostics_copy'][config_obj['langcode']],
+                        icon=ft.Icons.CONTENT_COPY,
+                        on_click=copy_diag,
+                        key='diagnostics_copy_btn',
+                    ),
+                    ft.Button(
+                        TRANSLATIONS['common_close'][config_obj['langcode']],
+                        on_click=close_diag,
+                        key='diagnostics_close_btn',
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+                key='engine_diagnostics_dialog',
+            )
+            page.show_dialog(diag_modal)
+
+        def dismiss_engine_warning_banner(_=None):
+            model_state['banner_dismissed'] = True
+            engine_warning_banner.visible = False
+            page.update()
+
+        engine_diag_btn = ft.OutlinedButton(
+            TRANSLATIONS['engine_diagnostics_btn'][config_obj['langcode']],
+            icon=ft.Icons.MONITOR_HEART,
+            on_click=show_diagnostics_dialog,
+            key='engine_diagnostics_btn',
+        )
+        engine_warning_banner = ft.Container(
+            visible=False,
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            bgcolor=ft.Colors.AMBER_100,
+            border=ft.Border.all(1, ft.Colors.AMBER_400),
+            border_radius=8,
+            key='engine_warning_banner',
+            content=ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.AMBER_900, size=20),
+                    engine_warning_text,
+                    ft.TextButton(
+                        TRANSLATIONS['engine_fallback_details_btn'][config_obj['langcode']],
+                        on_click=show_diagnostics_dialog,
+                        key='engine_warning_details_btn',
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.CLOSE,
+                        icon_color=ft.Colors.AMBER_900,
+                        icon_size=16,
+                        on_click=dismiss_engine_warning_banner,
+                        key='engine_warning_dismiss_btn',
+                    ),
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
+        def refresh_engine_status_ui():
+            lang = config_obj['langcode']
+            if models_are_ready():
+                engine_status_text.value = format_gui_engine_status(
+                    origin_detector, origin_recognizer, lang
+                )
+            elif model_state.get('error') is not None:
+                engine_status_text.value = (
+                    '実行エンジン: 初期化失敗' if lang == 'ja' else 'Engine: initialization failed'
+                )
+            else:
+                engine_status_text.value = TRANSLATIONS['engine_status_loading'][lang]
+
+            warning_info = collect_engine_warnings(
+                origin_detector,
+                origin_recognizer,
+                origin_recognizer30,
+                origin_recognizer50,
+                origin_table_recognizer,
+                table_error=model_state.get('table_error'),
+            )
+            has_issue = bool(
+                model_state.get('error') is not None
+                or warning_info['fallback_occurred']
+                or warning_info['table_warning']
+            )
+            engine_diag_btn.icon = ft.Icons.WARNING_AMBER if has_issue else ft.Icons.MONITOR_HEART
+
+            if TABLE_STRUCTURE_FEATURE is not None:
+                if not TABLE_STRUCTURE_FEATURE.is_supported():
+                    table_structure_notice_text.value = (
+                        TABLE_STRUCTURE_FEATURE.unsupported_reason(lang) or ''
+                    )
+                    table_structure_notice_text.visible = bool(table_structure_notice_text.value)
+                elif model_state.get('table_error') is not None:
+                    prefix = TRANSLATIONS['table_structure_unavailable_prefix'][lang]
+                    table_structure_notice_text.value = f"{prefix}: {model_state['table_error']}"
+                    table_structure_notice_text.visible = True
+                else:
+                    table_structure_notice_text.value = ''
+                    table_structure_notice_text.visible = False
+
+            if has_issue and not model_state.get('banner_dismissed'):
+                if model_state.get('error') is not None:
+                    summary = (
+                        f"OCRモデル初期化に失敗しました: {model_state['error']}"
+                        if lang == 'ja'
+                        else f"OCR model initialization failed: {model_state['error']}"
+                    )
+                elif warning_info['fallback_occurred'] and warning_info['warnings']:
+                    first_line = warning_info['warnings'][0].splitlines()[0]
+                    if first_line.startswith('[WARN]'):
+                        first_line = first_line[len('[WARN]'):].strip()
+                    summary = f"{TRANSLATIONS['engine_fallback_banner_title'][lang]} — {first_line}"
+                elif warning_info['fallback_occurred']:
+                    summary = TRANSLATIONS['engine_fallback_banner_title'][lang]
+                else:
+                    prefix = TRANSLATIONS['table_structure_unavailable_prefix'][lang]
+                    summary = f"{prefix}: {warning_info['table_warning'].splitlines()[0]}"
+                engine_warning_text.value = summary
+                engine_warning_banner.visible = True
+            else:
+                engine_warning_banner.visible = False
         for settings_checkbox in (
             chkbx_json,
             chkbx_txt,
@@ -2476,9 +3061,16 @@ def main(page: ft.Page, args=None, download_models=False):
         )
         preview_prev_btn = ft.Button(content=TRANSLATIONS['main_prev_btn'][config_obj['langcode']], on_click=prev_image, disabled=True)
         preview_next_btn = ft.Button(content=TRANSLATIONS['main_next_btn'][config_obj['langcode']], on_click=next_image, disabled=True)
+        def open_customize_dialog(e):
+            dropdown_device.options = build_device_dropdown_options(
+                detect_available_backends(refresh=True), config_obj['langcode'] == 'ja'
+            )
+            refresh_engine_status_ui()
+            page.show_dialog(customize_dlg_modal)
+
         customize_btn = ft.Button(
             TRANSLATIONS['main_customize_btn'][config_obj['langcode']],
-            on_click=lambda e: page.show_dialog(customize_dlg_modal),
+            on_click=open_customize_dialog,
             key='customize_output',
         )
         format_grid = ft.Row(
@@ -2542,7 +3134,11 @@ def main(page: ft.Page, args=None, download_models=False):
             [
                 chkbx_text_daisy,
                 chkbx_character_inclusion,
-                *([chkbx_table_structure] if chkbx_table_structure is not None else []),
+                *(
+                    [chkbx_table_structure, table_structure_notice_text]
+                    if chkbx_table_structure is not None
+                    else []
+                ),
             ],
             'settings_additional_section',
         )
@@ -2555,7 +3151,14 @@ def main(page: ft.Page, args=None, download_models=False):
                     controls=[
                         dropdown_device,
                         dropdown_batch_size,
+                        dropdown_precision,
                         device_id_textfield,
+                        ft.OutlinedButton(
+                            TRANSLATIONS['engine_diagnostics_btn'][config_obj['langcode']],
+                            icon=ft.Icons.MONITOR_HEART,
+                            on_click=show_diagnostics_dialog,
+                            key='settings_diagnostics_btn',
+                        ),
                     ],
                     spacing=8,
                     wrap=True,
@@ -2799,8 +3402,9 @@ def main(page: ft.Page, args=None, download_models=False):
             ft.Row([
                 localebutton,
                 engine_status_text,
+                engine_diag_btn,
                 *datapool_header_controls,
-            ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True),
             'a11y_app_settings_section',
         )
         quick_actions_section = build_main_semantics_section(
@@ -2945,6 +3549,7 @@ def main(page: ft.Page, args=None, download_models=False):
         parts_control(initial_model_lock)
         page.add(
             app_settings_section,
+            engine_warning_banner,
             quick_actions_section,
             ft.Divider(),
             input_section,
@@ -2960,31 +3565,90 @@ def main(page: ft.Page, args=None, download_models=False):
         async def initialize_models():
             nonlocal origin_detector, origin_recognizer
             nonlocal origin_recognizer30, origin_recognizer50
-            nonlocal origin_table_recognizer
+            nonlocal origin_table_recognizer, loaded_engine_state
 
             started_at = time.perf_counter()
+            had_previous = models_are_ready()
+            prev_models = (
+                origin_detector,
+                origin_recognizer,
+                origin_recognizer30,
+                origin_recognizer50,
+                origin_table_recognizer,
+            )
+            prev_engine_state = dict(loaded_engine_state) if loaded_engine_state is not None else None
+            reload_scope = model_state.get('reload_scope', 'all')
+            attempted_state = extract_engine_state(args)
+            LOGGER.info(
+                'Initializing OCR models | scope=%s | target=%s',
+                reload_scope,
+                attempted_state,
+            )
+            reuse_det = origin_detector if (reload_scope == 'recognizers' and had_previous) else None
+            reuse_table = origin_table_recognizer if (reload_scope == 'recognizers' and had_previous) else None
             try:
                 (
-                    origin_detector,
-                    origin_recognizer,
-                    origin_recognizer30,
-                    origin_recognizer50,
+                    new_detector,
+                    new_recognizer,
+                    new_recognizer30,
+                    new_recognizer50,
                 ) = await asyncio.to_thread(
-                    load_ocr_models, args, download_models=download_models
+                    load_ocr_models,
+                    args,
+                    download_models=download_models,
+                    reuse_detector=reuse_det,
                 )
-                origin_table_recognizer = None
-                model_state['table_error'] = None
-                if TABLE_STRUCTURE_FEATURE is not None:
-                    try:
-                        origin_table_recognizer = await asyncio.to_thread(
-                            load_table_recognizer, args, download_models=download_models
-                        )
-                    except Exception as table_ex:
-                        model_state['table_error'] = table_ex
-                        print(f'[WARN] Table structure initialization failed: {table_ex}')
+                if reuse_det is not None:
+                    new_table_recognizer = reuse_table
+                    new_table_error = model_state.get('table_error')
+                else:
+                    new_table_recognizer = None
+                    new_table_error = None
+                    if TABLE_STRUCTURE_FEATURE is not None:
+                        if not TABLE_STRUCTURE_FEATURE.is_supported():
+                            new_table_error = TABLE_STRUCTURE_FEATURE.unsupported_reason(
+                                config_obj['langcode']
+                            )
+                            LOGGER.info('Table structure gated off: %s', new_table_error)
+                        else:
+                            try:
+                                new_table_recognizer = await asyncio.to_thread(
+                                    load_table_recognizer, args, download_models=download_models
+                                )
+                            except Exception as table_ex:
+                                new_table_error = table_ex
+                                LOGGER.warning('Table structure initialization failed: %s', table_ex)
+                                print(f'[WARN] Table structure initialization failed: {table_ex}')
 
+                origin_detector = new_detector
+                origin_recognizer = new_recognizer
+                origin_recognizer30 = new_recognizer30
+                origin_recognizer50 = new_recognizer50
+                origin_table_recognizer = new_table_recognizer
+                loaded_engine_state = attempted_state
+                model_state['table_error'] = new_table_error
                 model_state['elapsed'] = time.perf_counter() - started_at
                 model_state['error'] = None
+                prev_models = None
+
+                for model_label, model_obj in (
+                    ('DEIMv2', origin_detector),
+                    ('PARSeq-100', origin_recognizer),
+                    ('PARSeq-30', origin_recognizer30),
+                    ('PARSeq-50', origin_recognizer50),
+                    ('TableCenterNet', origin_table_recognizer),
+                ):
+                    prof = getattr(model_obj, 'backend_profile', None)
+                    if prof is not None:
+                        LOGGER.info(
+                            'Model ready: %s | backend=%s | providers=%s | fallback=%s | warning=%s',
+                            model_label,
+                            prof.active_backend,
+                            prof.active_providers,
+                            prof.fallback_occurred,
+                            prof.warning_message,
+                        )
+                LOGGER.info('Model initialization completed in %.2fs', model_state['elapsed'])
 
                 for tool in (selector, capture_tool):
                     tool.detector = origin_detector
@@ -2994,9 +3658,7 @@ def main(page: ft.Page, args=None, download_models=False):
                     tool.table_recognizer = origin_table_recognizer
 
                 progressbar.value = 0
-                engine_status_text.value = format_gui_engine_status(
-                    origin_detector, origin_recognizer, config_obj['langcode']
-                )
+                refresh_engine_status_ui()
                 if config_obj['langcode'] == 'ja':
                     if TABLE_STRUCTURE_FEATURE is None:
                         set_progress_message(f'OCRモデル準備完了 ({model_state["elapsed"]:.1f}秒)')
@@ -3012,35 +3674,48 @@ def main(page: ft.Page, args=None, download_models=False):
                     else:
                         set_progress_message(f'OCR models ready / TableInfer models unavailable ({model_state["elapsed"]:.1f} sec)')
             except Exception as ex:
+                LOGGER.exception('OCR model initialization failed: %s', ex)
                 model_state['error'] = ex
-                pending_engine_reload['pending'] = False
                 progressbar.value = 0
-                if config_obj['langcode'] == 'ja':
-                    engine_status_text.value = '実行エンジン: 初期化失敗'
+                if had_previous and prev_models is not None:
+                    (
+                        origin_detector,
+                        origin_recognizer,
+                        origin_recognizer30,
+                        origin_recognizer50,
+                        origin_table_recognizer,
+                    ) = prev_models
+                    loaded_engine_state = prev_engine_state
+                    model_state['error'] = None
+                    refresh_engine_status_ui()
+                    if config_obj['langcode'] == 'ja':
+                        set_progress_message(f'モデル再読み込み失敗（以前の設定を維持）: {ex}')
+                    else:
+                        set_progress_message(f'Model reload failed (kept previous engine): {ex}')
                 else:
-                    engine_status_text.value = 'Engine: initialization failed'
-                set_progress_message(f'OCR model initialization failed: {ex}')
+                    refresh_engine_status_ui()
+                    set_progress_message(f'OCR model initialization failed: {ex}')
             finally:
                 model_state['loading'] = False
+                model_state['reload_scope'] = 'all'
                 if datapool_batch_extension is not None:
                     datapool_batch_extension.set_models_ready(models_are_ready())
                 set_model_loading_lock(False)
                 parts_control(False)
                 page.update()
-                if (
-                    pending_engine_reload['pending']
-                    and not busy_tracker.active
-                    and model_state.get('error') is None
-                ):
+                if pending_engine_reload['pending'] and not busy_tracker.active:
                     pending_engine_reload['pending'] = False
-                    start_engine_reload()
+                    resolve_gui_engine_args(args, config_obj, cli_overrides)
+                    if (
+                        model_state.get('error') is None
+                        or extract_engine_state(args) != attempted_state
+                    ):
+                        start_engine_reload()
 
         if models_are_ready():
             set_model_loading_lock(False)
             parts_control(False)
-            engine_status_text.value = format_gui_engine_status(
-                origin_detector, origin_recognizer, config_obj['langcode']
-            )
+            refresh_engine_status_ui()
             if model_state['elapsed'] is not None:
                 if config_obj['langcode'] == 'ja':
                     if TABLE_STRUCTURE_FEATURE is None:

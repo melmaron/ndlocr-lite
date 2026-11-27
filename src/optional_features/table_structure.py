@@ -14,8 +14,30 @@ class TableStructureFeature:
             self._engine = tablecenternet
         return self._engine
 
+    def is_supported(self) -> bool:
+        import onnxruntime as ort
+        from ort_provider import ort_supports_deform_conv
+
+        return bool(ort_supports_deform_conv(getattr(ort, '__version__', None)))
+
+    def unsupported_reason(self, langcode: str = 'ja') -> str | None:
+        if self.is_supported():
+            return None
+        import onnxruntime as ort
+
+        ort_ver = getattr(ort, '__version__', 'unknown')
+        if langcode == 'en':
+            return (
+                f'Table structure estimation requires ONNX Runtime >= 1.25 (DeformConv), '
+                f'but onnxruntime=={ort_ver} is installed.'
+            )
+        return (
+            f'表構造の推定には ONNX Runtime 1.25 以上（DeformConv 対応）が必要ですが、'
+            f'現在の環境は onnxruntime=={ort_ver} のため無効化されています。'
+        )
+
     def default_config(self):
-        return {'table_structure': True}
+        return {'table_structure': self.is_supported()}
 
     def add_arguments(self, parser, source_dir):
         parser.add_argument(
@@ -131,16 +153,24 @@ class TableStructureFeature:
         return self.engine.build_tables_html_document(document_name, table_results)
 
     def create_output_control(self, config_obj):
+        supported = self.is_supported()
+        reason = self.unsupported_reason(config_obj.get('langcode', 'ja'))
         return ft.Checkbox(
             label='表構造の推定（HTML出力）',
-            value=config_obj.get('table_structure', True),
+            value=bool(config_obj.get('table_structure', True)) if supported else False,
+            disabled=not supported,
+            tooltip=reason,
             key='output_table_structure',
         )
 
     def create_capture_control(self, config_obj):
+        supported = self.is_supported()
+        reason = self.unsupported_reason(config_obj.get('langcode', 'ja'))
         return ft.Checkbox(
             label='表の構造化',
-            value=config_obj.get('table_structure', True),
+            value=bool(config_obj.get('table_structure', True)) if supported else False,
+            disabled=not supported,
+            tooltip=reason,
             key='capture_table_structure',
         )
 

@@ -1,16 +1,39 @@
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sys
 from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from onnx_batch_patcher import is_dynamic_batch_model, prepare_parseq_model
+from onnx_batch_patcher import (
+    invalidate_parseq_cache,
+    is_dynamic_batch_model,
+    prepare_parseq_model,
+)
 from ort_provider import (
+    _emit_warning_once,
     create_inference_session,
     normalize_device_name,
+    normalize_precision_name,
     resolve_auto_backend_name,
 )
+
+
+def _is_corrupt_model_load_error(exc: Exception) -> bool:
+    if type(exc).__name__ in {"InvalidProtobuf", "InvalidGraph"}:
+        return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "invalidprotobuf",
+            "protobuf parsing failed",
+            "invalid_graph",
+            "invalidgraph",
+            "missing opset",
+            "failed to load model",
+        )
+    )
 
 
 def _remove_ascii_spaces_around_japanese_punctuation(text: str) -> str:
@@ -38,7 +61,10 @@ class PARSEQ:
         self.device_id = int(device_id or 0)
         self.requested_batch_size = int(batch_size or 0)
         self.strict_device = bool(strict_device)
-        self.precision = precision
+        self.precision = normalize_precision_name(precision)
+        self.requested_precision = self.precision
+        self.effective_precision = "fp32"
+        self.precision_fallback_occurred = False
         self.image_width, self.image_height = original_size
         self.backend_profile = None
         self.dynamic_batch = False
@@ -49,31 +75,114 @@ class PARSEQ:
     def create_session(self) -> None:
         requested = normalize_device_name(self.device)
         resolved_target = resolve_auto_backend_name() if requested == "auto" else requested
+        effective_precision = self.precision
+        if effective_precision == "fp16" and resolved_target == "cpu":
+            _emit_warning_once(
+                ("parseq", "precision", "cpu_fp16_downgrade"),
+                "[WARN] --precision fp16 is not beneficial on CPUExecutionProvider; falling back to fp32.",
+            )
+            effective_precision = "fp32"
+
         want_dynamic = resolved_target != "cpu" and self.requested_batch_size != 1
 
         effective_path = Path(self.model_path)
-        if want_dynamic:
+        from_cache = False
+        prepared_precision = effective_precision
+        if want_dynamic or effective_precision != "fp32":
             patched = prepare_parseq_model(
                 effective_path,
-                enable_dynamic_batch=True,
-                precision=self.precision,
+                enable_dynamic_batch=want_dynamic,
+                precision=effective_precision,
             )
             effective_path = patched.model_path
             self.dynamic_batch = patched.dynamic_batch
+            effective_precision = patched.precision
+            from_cache = patched.from_cache
         else:
             self.dynamic_batch = is_dynamic_batch_model(effective_path)
 
         self.effective_model_path = str(effective_path)
-        session, profile = create_inference_session(
-            self.effective_model_path,
-            device=self.device,
-            device_id=self.device_id,
-            strict_device=self.strict_device,
-            cpu_single_thread=True,
-            # Dynamic-batch unrolled decoders trigger O(N^2) reuse planning in ORT (~35s on rec100).
-            enable_mem_reuse=not self.dynamic_batch,
-            model_label=f"PARSEQ({Path(self.model_path).name})",
-        )
+        try:
+            session, profile = create_inference_session(
+                self.effective_model_path,
+                device=self.device,
+                device_id=self.device_id,
+                strict_device=self.strict_device,
+                cpu_single_thread=True,
+                # Dynamic-batch unrolled decoders trigger O(N^2) reuse planning in ORT (~35s on rec100).
+                enable_mem_reuse=not self.dynamic_batch,
+                model_label=f"PARSEQ({Path(self.model_path).name})",
+            )
+        except Exception as exc:
+            if (
+                from_cache
+                and Path(self.effective_model_path) != Path(self.model_path)
+                and _is_corrupt_model_load_error(exc)
+            ):
+                _emit_warning_once(
+                    ("parseq", "cache_reload", Path(self.model_path).name),
+                    f"[WARN] Cached PARSeq model failed to load ({exc}); rebuilding: {Path(self.model_path).name}",
+                )
+                invalidate_parseq_cache(
+                    Path(self.model_path),
+                    precision=prepared_precision,
+                    dynamic_batch=want_dynamic,
+                    cached_path=Path(self.effective_model_path),
+                )
+                patched = prepare_parseq_model(
+                    Path(self.model_path),
+                    enable_dynamic_batch=want_dynamic,
+                    precision=prepared_precision,
+                )
+                self.dynamic_batch = patched.dynamic_batch
+                effective_precision = patched.precision
+                self.effective_model_path = str(patched.model_path)
+                try:
+                    session, profile = create_inference_session(
+                        self.effective_model_path,
+                        device=self.device,
+                        device_id=self.device_id,
+                        strict_device=self.strict_device,
+                        cpu_single_thread=True,
+                        enable_mem_reuse=not self.dynamic_batch,
+                        model_label=f"PARSEQ({Path(self.model_path).name})",
+                    )
+                except Exception as retry_exc:
+                    if _is_corrupt_model_load_error(retry_exc):
+                        raise RuntimeError(
+                            f"PARSeq ONNX model file appears corrupted or unreadable: {self.effective_model_path} ({retry_exc})"
+                        ) from retry_exc
+                    raise
+            elif _is_corrupt_model_load_error(exc):
+                raise RuntimeError(
+                    f"PARSeq ONNX model file appears corrupted or unreadable: {self.effective_model_path} ({exc})"
+                ) from exc
+            else:
+                raise
+        if profile.active_backend == "cpu" and effective_precision == "fp16":
+            orig_profile = profile
+            _emit_warning_once(
+                ("parseq", "precision", "runtime_cpu_fp16_fallback"),
+                f"[WARN] Falling back to original FP32 model on CPU for {Path(self.model_path).name} after GPU fallback.",
+            )
+            fallback_path = Path(self.model_path)
+            self.dynamic_batch = is_dynamic_batch_model(fallback_path)
+            self.effective_model_path = str(fallback_path)
+            effective_precision = "fp32"
+            session, profile = create_inference_session(
+                self.effective_model_path,
+                device="cpu",
+                device_id=self.device_id,
+                strict_device=False,
+                cpu_single_thread=True,
+                enable_mem_reuse=not self.dynamic_batch,
+                model_label=f"PARSEQ({Path(self.model_path).name})",
+            )
+            profile.requested_device = orig_profile.requested_device
+            profile.fallback_occurred = orig_profile.fallback_occurred
+            profile.warning_message = orig_profile.warning_message
+        self.effective_precision = effective_precision
+        self.precision_fallback_occurred = self.requested_precision != self.effective_precision
         self.session = session
         self.backend_profile = profile
         self.model_inputs = self.session.get_inputs()
@@ -97,6 +206,19 @@ class PARSEQ:
         else:
             self.batch_size = max(1, int(profile.default_batch_size))
 
+    def warmup(self) -> None:
+        """Run a capped dummy inference batch to trigger first-run kernel setup."""
+        if not self.dynamic_batch or self.batch_size <= 1:
+            warmup_bs = 1
+        else:
+            max_warmup_bs = 8 if int(self.input_width) >= 512 else 16
+            warmup_bs = max(1, min(int(self.batch_size), max_warmup_bs))
+        dummy = np.zeros(
+            (warmup_bs, 3, int(self.input_height), int(self.input_width)),
+            dtype=self.input_dtype,
+        )
+        self.session.run(self.output_names, {self.input_names[0]: dummy})
+
     def postprocess(self, outputs):
         predictions = np.squeeze(outputs).T
         scores = np.max(predictions[:, 4:], axis=1)
@@ -115,7 +237,7 @@ class PARSEQ:
             (self.input_width, self.input_height),
             interpolation=cv2.INTER_LINEAR,
         )
-        input_image = np.ascontiguousarray(resized[:, :, ::-1]).astype(np.float32)
+        input_image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
         input_image /= 127.5
         input_image -= 1.0
         tensor = input_image.transpose(2, 0, 1)
@@ -137,17 +259,12 @@ class PARSEQ:
                 (0, 3, self.input_height, self.input_width),
                 dtype=self.input_dtype,
             )
-        if len(imgs) >= 8:
-            max_workers = min(4, len(imgs))
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="parseq-prep") as pool:
-                tensors = list(
-                    pool.map(lambda im: self._preprocess_single(im, auto_rotate=auto_rotate), imgs)
-                )
-        else:
-            tensors = [self._preprocess_single(im, auto_rotate=auto_rotate) for im in imgs]
+        tensors = [self._preprocess_single(im, auto_rotate=auto_rotate) for im in imgs]
         return np.ascontiguousarray(np.stack(tensors, axis=0))
 
     def _decode_outputs(self, outputs: np.ndarray, *, clean_punctuation: bool = True) -> List[str]:
+        if outputs.dtype == np.float16:
+            outputs = outputs.astype(np.float32)
         all_indices = np.argmax(outputs, axis=2)
         texts: List[str] = []
         for row_idx in range(all_indices.shape[0]):

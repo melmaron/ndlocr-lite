@@ -21,10 +21,28 @@
 
 ---
 
-## 2. インストール方法
+## 2. インストール方法と配布バイナリの前提条件
 
 > [!IMPORTANT]
 > `onnxruntime` と `onnxruntime-gpu` を同一環境に混在インストールするとパッケージファイルが衝突するため、GPU 版へ切り替える際は必ず `onnxruntime` をアンインストールしてから導入してください。
+
+### 2.0 配布パッケージ（GUI バイナリ）の前提条件とトラブルシューティング
+
+GitHub Releases で配布しているビルド済み GUI パッケージ（Windows / Linux の各 `cuda`・`gpu_generic` 4 ターゲット）では、以下のランタイムが外部依存となります。
+
+| ターゲット | 同梱 EP | 別途必要な環境（非同梱） | 補足 |
+|---|---|---|---|
+| `windows_cuda.zip` | CUDA (`ORT 1.31.1`) | **CUDA 13 ランタイム (`cudart64_13.dll`, `cublas64_13.dll` 等) + cuDNN 9 (`cudnn64_9.dll`)** | 非同梱。CUDA 12 のみの環境では起動時 preflight が不足 DLL を検出し、警告バナー付きで CPU へフォールバックします |
+| `linux_cuda.tar.gz` | CUDA (`ORT 1.31.1`) | **CUDA 13 ランタイム (`libcudart.so.13`, `libcublas.so.13` 等) + cuDNN 9 (`libcudnn.so.9`)** + GTK3 (`libgtk-3-0`) + glibc 2.35+ | Ubuntu 22.04 以降目安 |
+| `windows_gpu_generic.zip` | WebGPU / OpenVINO | DirectX 12 対応 GPU ドライバ | NVIDIA GPU では WebGPU の `CompileShaderDXC E_INVALIDARG` で CPU に落ちる場合があるため、`cuda` 版の代替にはなりません |
+| `linux_gpu_generic.tar.gz` | WebGPU / OpenVINO | Vulkan (`libvulkan.so.1`) + GPU ドライバ + GTK3 + glibc 2.35+ | `onnxruntime-ep-openvino` は **x86_64 のみ**対応（ARM64 Linux は WebGPU のみ） |
+
+- **配布 `cuda` 版で GPU が使えない場合（CUDA 12 のみ・未導入環境）**:
+  - 配布パッケージには Python / `pip` が同梱されないため、システムに **NVIDIA CUDA Toolkit 13.x** および **cuDNN 9.x** をインストールし、Windows では両者の `bin` フォルダが環境変数 `PATH` に（Linux では `lib` フォルダが `LD_LIBRARY_PATH` 等に）含まれている状態でアプリを再起動してください。
+  - GUI 起動時に不足 DLL 名（例: `cudart64_13.dll`, `cudnn64_9.dll`）とシステム上の CUDA 12 検出有無が警告バナーおよび「環境診断」ダイアログへ自動表示され、`ndlocr-lite.log` にも記録されます。
+- **AMD MIGraphX / ROCm・macOS について**:
+  - AMD Radeon 向けの `migraphx` / `rocm` は配布バイナリには含まれず、Linux ROCm 環境でのソース導入限定です（配布パッケージの AMD GPU は `gpu_generic` の WebGPU を利用）。
+  - macOS は実機検証が無く、CoreML EP 未対応（CPU 専用）かつ `onnxruntime==1.23.2` 固定で `TableCenterNet`（ORT >= 1.25 必須）も非対応のため、配布バイナリ対象外としています。
 
 ### 2.1 汎用 GPU 構成（AMD Radeon / Intel Arc / Vulkan・D3D12 対応 GPU）
 
@@ -92,7 +110,8 @@ python3 src/ocr.py --check-device
 |---|---|---|
 | `--device` | `auto` | 使用する推論デバイス (`auto`, `cuda`, `migraphx`, `rocm`, `openvino`, `webgpu`, `dml`, `cpu`) |
 | `--device-id` | `0` | マルチ GPU 環境でのデバイスインデックス |
-| `--batch-size` | CUDA/MIGraphX/ROCm=`32`, OpenVINO/WebGPU/DML=`16`, CPU=`1` (`0`=自動) | PARSeq 文字認識のバッチサイズ上限 |
+| `--batch-size` | CUDA=`64`, MIGraphX/ROCm=`32`, OpenVINO/WebGPU/DML=`16`, CPU=`1` (`0`=自動) | PARSeq 文字認識のバッチサイズ上限 |
+| `--precision` | `fp32` | PARSeq の推論精度（`fp32`: 既定の厳密精度 / `fp16`: GPU 向けの高速・省 VRAM **近似**モード。`fp32` と完全一致しない場合があり、特に長行 `rec100` や `--enable-tcy` で微小差が出うる。CPU 実行時は自動で `fp32` へフォールバック） |
 | `--strict-device` | 無効 (`False`) | 指定 GPU バックエンド初期化失敗時に CPU へフォールバックせず終了する |
 | `--check-device` | 無効 (`False`) | デバイス診断結果を表示して終了する |
 
@@ -106,24 +125,31 @@ python3 src/ocr.py --sourcedir input_dir --output out_dir --device webgpu --batc
 
 # フォールバックを許可せず CUDA で厳密実行
 python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --strict-device
+
+# CUDA で PARSeq 混合精度 FP16 を有効化（省 VRAM・高速化向け）
+python3 src/ocr.py --sourcedir input_dir --output out_dir --device cuda --precision fp16
 ```
 
 ### 3.3 デスクトップ GUI
 
-- メイン画面上に現在有効な推論エンジン（例: `実行エンジン: GPU (CUDA), batch=32` や `実行エンジン: GPU (WebGPU), batch=16`）のステータスが表示されます。
-- **出力設定ダイアログ**内の「実行環境・GPU高速化」から、実行デバイス・GPU ID・バッチサイズを変更して即座にモデルを再読み込みできます。
+- メイン画面上部に現在有効な推論エンジン（例: `実行エンジン: GPU (CUDA), batch=64`、`実行エンジン: GPU (CUDA), batch=64, fp16 (近似)`、CPU フォールバック時 ` [fallback]`）のステータスと **「環境診断」** ボタンが表示されます。
+- GPU の初期化や CUDA/cuDNN ランタイムの事前検証で問題が見つかり CPU へフォールバックした場合は、メイン画面上部に **警告バナー** が表示され、「原因と対処法を見る」から不足ライブラリやセットアップ手順をその場で確認・コピーできます。
+- 起動時・モデル読み込み時の環境診断結果・各モデルの実行プロバイダ・警告・エラーはアプリデータディレクトリ内の `ndlocr-lite.log`（ローテーションログ）へ自動保存されます。
+- **出力設定ダイアログ**内の「実行環境・GPU高速化」から、実行デバイス・バッチサイズ・推論精度 (`FP32` / `FP16`)・GPU ID の変更と「環境診断」の表示が行えます。
+- `onnxruntime < 1.25`（例: DirectML `1.24.4` や Python 3.10 / macOS 向け `1.23.2`）では `TableCenterNet`（`DeformConv`）機能が自動で無効化され、理由が UI に表示されます。
 
 ---
 
 ## 4. 並列化と精度保証の仕組み
 
-1. **PARSeq 動的バッチパッチとローカルキャッシュ**:
-   公式 PARSeq 3モデル（`24x256-30`, `24x384-50`, `24x768-100`）は静的 `batch=1` でエクスポートされています。本フォークは実行時に動的バッチ axis (`N`) へパッチしたモデルを自動生成し、将来の FP16 拡張に備えたキャッシュ名（`{stem}_{hash12}_dynbatch_fp32_v1.onnx`）でローカルキャッシュします。生成時に `batch=1` との出力・`argmax` 一致検査を行い、異常があれば安全に `batch=1` 逐次処理へフォールバックします。
-   - **DEIMv2 (`deim-s-1024x1024-261124.onnx`)** はデコーダ内の `GatherElements` 構造上 `batch=1` を維持し、**TableCenterNet (`tablecenternet_s_800_v3.onnx`)** も `batch=1` で動作します。
-2. **3段パイプライン並列化**:
-   複数ページ・PDF・ディレクトリ処理時に `[次ページ画像読み込み + DEIM 前処理 (CPU)]` → `[DEIM + 3段 PARSeq 動的バッチ + 表認識 (GPU)]` → `[XML / JSON / TXT / 可視化・PDF 書出し (CPU)]` をオーバーラップ実行します。
+1. **PARSeq 動的バッチ／混合精度 FP16 パッチと sidecar キャッシュ**:
+   公式 PARSeq 3モデル（`24x256-30`, `24x384-50`, `24x768-100`）は静的 `batch=1` でエクスポートされています。本フォークは実行時に動的バッチ axis (`N`) へパッチしたモデルを自動生成し、`{stem}_{hash12}_{dynbatch|static}_{fp32|fp16}_v1.onnx` と `.meta.json` sidecar を使ってローカルキャッシュします（2回目以降は stat と軽量 BLAKE2b ダイジェスト照合により SHA-256 と `onnx.load` を省略し、同サイズ・同タイムスタンプ破損を含む不整合や ORT ロード失敗時はキャッシュを破棄して自動再構築します）。
+   - `--precision fp16` 指定時は、PARSeq のみ混合精度 FP16 変換（`keep_io_types=True` で入出力 logits を FP32 に維持し、`Softmax` とそこへ入力するアテンションスコア `MatMul`／マスク演算を FP32 アイランドとして保持、Cast 重複除去とトポロジカルソートを実施）を行います。`fp16` は高速・省 VRAM 向けの**近似モード**であり、特に長行 (`rec100`) や `--enable-tcy` 併用時に `fp32` と微小な文字差が生じる場合があります。CPU バックエンド時は自動で `fp32` にフォールバックします。
+   - **DEIMv2 (`deim-s-1024x1024-261124.onnx`)** はデコーダ内の `GatherElements` 構造上 `batch=1`・FP32 固定とし、**TableCenterNet (`tablecenternet_s_800_v3.onnx`)** も `batch=1`・FP32 固定で動作します。
+2. **並列モデル初期化＋warm-up と 3 段パイプライン並列化**:
+   CPU および CUDA バックエンドでは 4 モデルのセッション構築を `ThreadPoolExecutor(4)` で並列化し（GUI でバッチサイズや精度のみ変更した場合は DEIMv2 / TableCenterNet を再利用して PARSeq のみ再構築）、GPU セッションでは初期化直後に各スレッド内で上限付きバッチ warm-up（`rec30`/`rec50` は最大 `batch=16`、`rec100` は最大 `batch=8`）を実行します（warm-up で例外が起きても警告のみで初期化は継続します）。複数ページ・PDF・ディレクトリ処理時は `[次ページ画像読み込み + DEIM 前処理 (CPU)]` → `[DEIM + 3段 PARSeq 動的バッチ + 表認識 (GPU)]` → `[XML / JSON / TXT / 可視化・PDF 書出し (CPU)]` をオーバーラップ実行します。
 3. **精度の厳密維持**:
-   全モデル既定 **FP32** 精度で動作し、`CUDAExecutionProvider` には `"use_tf32": "0"` を自動指定して Ampere 世代以降（RTX 3070 等）での TF32 演算による微小差（1px 枠ずれ・読み順入替等）を抑止しているため、CPU `batch=1` と同一の認識結果（テキスト・座標・読み順）を出力します。
+   既定の `--precision fp32` では全モデル FP32 精度で動作し、`CUDAExecutionProvider` には `"use_tf32": "0"` を自動指定して Ampere 世代以降（RTX 3070 等）での TF32 演算による微小差を抑止しています。同梱 5 画像・3 ページ PDF E2E では CPU `batch=1` と差分 0 で完全一致し、一般的な複数ページ PDF でも認識テキスト・枠座標・読み順は一致します（`TEXTBLOCK CONF` 属性のみ EP 間の 1 ulp 浮動小数点差により `0.001` 異なる場合があります）。
 
 ---
 
@@ -189,4 +215,6 @@ python3 src/ocr.py --sourceimg sample.jpg --output out_dir --device cuda --stric
 
 ```bash
 python3 scripts/colab_verify_gpu.py --pages 12 --json-out colab_gpu_report.json
+# FP32 / FP16 両方の比較とブロックリスト検証も含める場合:
+python3 scripts/colab_verify_gpu.py --pages 12 --precision both --fp16-blocklist-bench --json-out colab_gpu_report.json
 ```

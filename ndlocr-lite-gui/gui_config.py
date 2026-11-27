@@ -17,6 +17,7 @@ GUI_DEFAULT_CONFIG = {
     'device': 'auto',
     'device_id': 0,
     'batch_size': 0,
+    'precision': 'fp32',
 }
 
 

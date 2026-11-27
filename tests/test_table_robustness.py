@@ -87,6 +87,14 @@ class TableCenterNetRobustnessTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"onnxruntime==1\.24\.4"):
                 tablecenternet.make_session_with_profile("table.onnx", device="dml")
 
+    def test_make_session_gates_on_ort_deform_conv_before_creating_session(self):
+        with patch.object(tablecenternet.ort, "__version__", "1.23.2"), patch(
+            "ort_provider.create_inference_session"
+        ) as mock_create:
+            with self.assertRaisesRegex(RuntimeError, r"1\.25.*onnxruntime==1\.23\.2"):
+                tablecenternet.make_session_with_profile("table.onnx", device="cpu")
+        mock_create.assert_not_called()
+
 
 class TableStructureFeatureTest(unittest.TestCase):
     def test_write_html_files_tolerates_none_inputs(self):
@@ -123,6 +131,32 @@ class TableStructureFeatureTest(unittest.TestCase):
             self.assertTrue(paths[0].is_file())
             self.assertEqual(item["html_path"], str(paths[0].resolve()))
             self.assertEqual(paths[0].name, "stem_table_00003.html")
+
+    def test_table_structure_feature_gates_by_ort_version(self):
+        import onnxruntime as ort
+
+        feature = TableStructureFeature()
+        with patch.object(ort, "__version__", "1.23.2"):
+            self.assertFalse(feature.is_supported())
+            self.assertEqual(feature.default_config(), {"table_structure": False})
+            self.assertIn("1.23.2", feature.unsupported_reason("ja"))
+            self.assertIn("1.23.2", feature.unsupported_reason("en"))
+            out_ctrl = feature.create_output_control({"table_structure": True, "langcode": "ja"})
+            cap_ctrl = feature.create_capture_control({"table_structure": True, "langcode": "en"})
+            self.assertFalse(out_ctrl.value)
+            self.assertTrue(out_ctrl.disabled)
+            self.assertIn("1.23.2", out_ctrl.tooltip)
+            self.assertFalse(cap_ctrl.value)
+            self.assertTrue(cap_ctrl.disabled)
+            self.assertIn("1.23.2", cap_ctrl.tooltip)
+
+        with patch.object(ort, "__version__", "1.31.1"):
+            self.assertTrue(feature.is_supported())
+            self.assertEqual(feature.default_config(), {"table_structure": True})
+            self.assertIsNone(feature.unsupported_reason("ja"))
+            out_ctrl_ok = feature.create_output_control({"table_structure": True, "langcode": "ja"})
+            self.assertTrue(out_ctrl_ok.value)
+            self.assertFalse(out_ctrl_ok.disabled)
 
 
 if __name__ == "__main__":

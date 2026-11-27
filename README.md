@@ -22,17 +22,18 @@
 
 GUI デスクトップアプリケーションのビルド済みパッケージは、**[Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases)** からダウンロードできます）。
 
-| OS | GPU / 環境 | ダウンロード対象ファイル名 |
-|---|---|---|
-| **Windows** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_windows_cuda.zip` |
-| **Windows** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_windows_gpu_generic.zip` |
-| **Linux** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_linux_cuda.tar.gz` |
-| **Linux** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_linux_gpu_generic.tar.gz` |
-| **macOS** | Apple Silicon (M シリーズ) | `ndlocr_lite_gpu_v*_macos_apple_silicon.tar.gz` |
-| **macOS** | Intel Mac | `ndlocr_lite_gpu_v*_macos_intel.tar.gz` |
+| OS | GPU / 環境 | ダウンロード対象ファイル名 | 別途必要な環境（前提条件） |
+|---|---|---|---|
+| **Windows** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_windows_cuda.zip` | **CUDA 13 ランタイム + cuDNN 9 必須（非同梱）**、CUDA 13 対応 NVIDIA ドライバ（CUDA 12 のみの環境では起動時に警告表示の上 CPU へフォールバック） |
+| **Windows** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_windows_gpu_generic.zip` | DirectX 12 対応ドライバ（注意: NVIDIA GPU では WebGPU の DXC コンパイル失敗で CPU に落ちる場合があり、`cuda` 版の代替にはなりません） |
+| **Linux** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_linux_cuda.tar.gz` | **CUDA 13 ランタイム + cuDNN 9 必須（非同梱）**、CUDA 13 対応 NVIDIA ドライバ、GTK3 (`libgtk-3-0`)・glibc 2.35 以上（Ubuntu 22.04 以降目安） |
+| **Linux** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_linux_gpu_generic.tar.gz` | Vulkan (`libvulkan.so.1`) + GPU ドライバ、GTK3・glibc 2.35 以上（OpenVINO は x86_64 のみ・ARM64 は WebGPU のみ） |
 
 > [!NOTE]
 > - 展開後のフォルダは **日本語（全角文字）を含まないパス**（例: `C:\ndlocr-lite\`）に配置して起動してください。
+> - **`cuda` 版に CUDA 13 / cuDNN 9 ランタイムは同梱されていません**（容量肥大回避のため）。CUDA 12 のみや未導入の環境では CPU へフォールバックし、画面上部の警告バナー・「環境診断」ダイアログ・ログファイル (`ndlocr-lite.log`) に不足ライブラリ名と対処法が表示されます。
+> - **macOS 版**: 実機検証が無く、CoreML EP 未対応（CPU 専用）かつ `onnxruntime==1.23.2` 固定で `TableCenterNet` 非対応となるため、本フォークの配布ビルド対象外としています（macOS 利用者は上流 [`ndl-lab/ndlocr-lite`](https://github.com/ndl-lab/ndlocr-lite) をご利用ください）。
+> - **AMD MIGraphX / ROCm**: 配布バイナリには含まれず、Linux ROCm 環境でのソース導入限定です（配布パッケージの AMD GPU は `gpu_generic` / WebGPU を利用）。
 > - CLI 版や Python ソースから直接実行したい場合は、下の [セットアップと使い方](#セットアップと使い方) を参照してください。
 
 ---
@@ -45,11 +46,11 @@ v2.0.0 標準の PDF 入出力・縦中横 (`--enable-tcy`)・表構造認識 (`
 |---|---|---|
 | **推論デバイス (`--device`)** | `cpu`（既定）または `cuda` の 2 択 | `auto`（既定）で `cuda > migraphx > rocm > openvino > webgpu > dml > cpu` を自動選択。失敗時は `cpu` へフォールバック（`--strict-device` / `--check-device` 対応） |
 | **AMD Radeon / Intel Arc** | 非対応 | ONNX Runtime `1.31.1` + Plugin EP（`webgpu` / `openvino`）および Linux ROCm（`migraphx` / `rocm`）に対応。**TableCenterNet (`DeformConv`)** も汎用 GPU 上で動作 |
-| **PARSeq 文字認識** | 静的 `batch=1` の逐次推論 | 実行時に ONNX グラフを動的バッチ軸へパッチし、`--batch-size`（既定 CUDA `32` / 汎用 GPU `16`）でバッチ推論。`enable_mem_reuse=False` により動的バッチの初期化遅延も解消 |
+| **PARSeq 文字認識** | 静的 `batch=1` の逐次推論 | 実行時に ONNX グラフを動的バッチ軸へパッチし、`--batch-size`（既定 CUDA `64` / MIGraphX・ROCm `32` / 汎用 GPU `16`）でバッチ推論。`enable_mem_reuse=False`・sidecar キャッシュ・並列セッション初期化＋warm-up により初期化・推論遅延を解消 |
 | **複数画像 / PDF 処理** | ページ単位の逐次実行 | `[前処理プリフェッチ (CPU)] → [検出 + 3段認識 + 表解析 (GPU)] → [XML/JSON/TXT/PDF 書出し (CPU)]` の **3 段パイプライン並列化** |
-| **デスクトップ GUI** | デバイス固定 | 出力設定に「実行環境・GPU高速化」を追加。画面上部に稼働バックエンドを表示し、処理中の設定変更は `BusyTracker` により完了後へ遅延適用 |
-| **認識精度と出力互換** | FP32 逐次基準 | **FP32 既定精度を維持**。`--enable-tcy` 有無を含め CPU `batch=1` と出力完全一致 |
-| **ビルド / CI** | 標準配布構成 | `ci.yml`（Win/Linux × Python 3.11/3.12 自動テスト）＋ `build-flet-cross.yml`（Win/Linux `cuda`・`gpu-generic`、macOS Intel/Apple Silicon の 6 ターゲットビルド） |
+| **デスクトップ GUI** | デバイス固定 | 出力設定に「実行環境・GPU高速化」（デバイス・バッチサイズ・推論精度・環境診断）を追加。画面上部に稼働バックエンドとフォールバック警告バナーを表示し、`ndlocr-lite.log` へ診断ログを記録 |
+| **認識精度と出力互換** | FP32 逐次基準 | **FP32 既定精度を維持**（5 画像・3p PDF 等で CPU `batch=1` と差分 0。複数ページ PDF も認識文字列・座標・読み順が一致し、`TEXTBLOCK CONF` のみ EP 間で 0.001 差が出うる）。オプションの `--precision fp16` で PARSeq 混合精度 FP16（高速・省 VRAM だが近似精度モードのため、特に長行 `rec100` や `--enable-tcy` で文字差が出うる）を選択可能 |
+| **ビルド / CI** | 標準配布構成 | `ci.yml`（Win/Linux × Python 3.11/3.12 自動テスト）＋ `build-flet-cross.yml`（Win/Linux の `cuda`・`gpu-generic` 4 ターゲットビルド＋成果物検証） |
 
 ---
 
@@ -122,13 +123,13 @@ Google Colab T4 Standard（`Tesla T4 15360 MiB`、NVIDIA driver `580.82.07`、`P
 | `--device` | Execution Provider | 対象 GPU / OS | 既定バッチ | TableCenterNet (`DeformConv`) | 要件ファイル |
 |---|---|---|---|---|---|
 | `auto` (既定) | 自動判定 | `CUDA > MIGraphX > ROCm > OpenVINO > WebGPU > DML > CPU` の優先順で自動選択（ソフトウェア/仮想 WebGPU は除外、不可時は `cpu`） | バックエンド準拠 | EP 準拠 | 用途に応じて選択 |
-| `cuda` | `CUDAExecutionProvider` | NVIDIA GPU (Windows / Linux、Ampere+ 互換のため `use_tf32=0` 自動適用) | `32` | 対応 (ORT 1.31.1 / 1.29.0) | [`requirements-cuda.txt`](./requirements-cuda.txt) |
-| `migraphx` | `MIGraphXExecutionProvider` | AMD Radeon (Linux ROCm 6.x+) | `32` | 対応 (ORT 1.27.1) | [`requirements-migraphx.txt`](./requirements-migraphx.txt) |
-| `rocm` | `ROCMExecutionProvider` | AMD Radeon (Linux ORT-ROCm) | `32` | 要 ORT >= 1.25 | 別ビルド ORT-ROCm |
-| `openvino` | `OpenVINOExecutionProvider` (`GPU`) | Intel Arc / Intel 内蔵 GPU (Win / Linux x86_64) | `16` | 対応 (Plugin EP + ORT 1.31.1) | [`requirements-gpu-generic.txt`](./requirements-gpu-generic.txt) |
-| `webgpu` | `WebGpuExecutionProvider` | AMD Radeon / Intel Arc / NVIDIA 他 (Win D3D12 / Linux Vulkan、仮想アダプタは `auto` 除外) | `16` | 対応 (Plugin EP + ORT 1.31.1) | [`requirements-gpu-generic.txt`](./requirements-gpu-generic.txt) |
-| `dml` | `DmlExecutionProvider` | Windows DirectX 12 GPU（`DEIMv2` は自動 CPU フォールバック、`PARSeq` のみ DML GPU） | `16` | **非対応** (`1.24.4` 制約) | `onnxruntime-directml==1.24.4` |
-| `cpu` | `CPUExecutionProvider` | 全環境 (Windows / macOS / Linux) | `1` | 対応 | [`requirements.txt`](./requirements.txt) |
+| `cuda` | `CUDAExecutionProvider` | NVIDIA GPU (Windows / Linux、CUDA 13 + cuDNN 9 必須・Ampere+ 互換のため `use_tf32=0` 自動適用) | `64` | 対応 (ORT 1.31.1 / 1.29.0) | [`requirements-cuda.txt`](./requirements-cuda.txt) |
+| `migraphx` | `MIGraphXExecutionProvider` | AMD Radeon (Linux ROCm 6.x+、**ソース導入限定**) | `32` | 対応 (ORT 1.27.1) | [`requirements-migraphx.txt`](./requirements-migraphx.txt) |
+| `rocm` | `ROCMExecutionProvider` | AMD Radeon (Linux ORT-ROCm、**ソース導入限定**) | `32` | 要 ORT >= 1.25 | 別ビルド ORT-ROCm |
+| `openvino` | `OpenVINOExecutionProvider` (`GPU`) | Intel Arc / Intel 内蔵 GPU (Win / Linux **x86_64 限定**) | `16` | 対応 (Plugin EP + ORT 1.31.1) | [`requirements-gpu-generic.txt`](./requirements-gpu-generic.txt) |
+| `webgpu` | `WebGpuExecutionProvider` | AMD Radeon / Intel Arc / NVIDIA 他 (Win D3D12 / Linux `libvulkan.so.1`、Win+NVIDIA は DXC エラーで CPU 落ちあり) | `16` | 対応 (Plugin EP + ORT 1.31.1) | [`requirements-gpu-generic.txt`](./requirements-gpu-generic.txt) |
+| `dml` | `DmlExecutionProvider` | Windows DirectX 12 GPU（`DEIMv2` は自動 CPU フォールバック、`PARSeq` のみ DML GPU） | `16` | **非対応** (`1.24.4` 制約・自動無効化) | `onnxruntime-directml==1.24.4` |
+| `cpu` | `CPUExecutionProvider` | 全環境（配布バイナリは Win/Linux；macOS はソース CPU のみ・CoreML 未対応） | `1` | ORT >= 1.25 で対応（`1.23.2` 等は無効） | [`requirements.txt`](./requirements.txt) |
 
 ---
 
@@ -156,6 +157,8 @@ pip install -r requirements-gpu-generic.txt
 # B) NVIDIA CUDA 13 系環境（PyPI 既定。システム CUDA 13 未導入時は pip の CUDA 13 wheel も追加）
 pip uninstall -y onnxruntime && pip install -r requirements-cuda.txt
 # システム CUDA 13 未導入時のランタイム wheel（起動時に ort.preload_dlls() で自動読み込み）:
+# pip install "onnxruntime-gpu[cuda,cudnn]==1.31.1"
+# または個別 wheel 指定:
 # pip install nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cusparse nvidia-cusolver nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cudnn-cu13
 
 # C) NVIDIA CUDA 12 系環境（Google Colab 等。Windows で cudnn64_9.dll が見つからない場合は PATH へ追加か nvidia-cudnn-cu12 を導入）
@@ -198,7 +201,8 @@ python3 src/ocr.py --sourcepdf input.pdf --output out_dir --pdf-output out_dir/o
 |---|---|---|
 | `--device` | `auto` | `[追加]` 推論デバイス (`auto`, `cuda`, `migraphx`, `rocm`, `openvino`, `webgpu`, `dml`, `cpu`) |
 | `--device-id` | `0` | `[追加]` マルチ GPU 環境でのデバイスインデックス |
-| `--batch-size` | CUDA/MIGraphX/ROCm=`32`, OpenVINO/WebGPU/DML=`16`, CPU=`1` (`0`=自動) | `[追加]` PARSeq 動的バッチ認識の最大バッチサイズ上限 |
+| `--batch-size` | CUDA=`64`, MIGraphX/ROCm=`32`, OpenVINO/WebGPU/DML=`16`, CPU=`1` (`0`=自動) | `[追加]` PARSeq 動的バッチ認識の最大バッチサイズ上限 |
+| `--precision` | `fp32` | `[追加]` PARSeq の推論精度（`fp32`: 厳密既定値 / `fp16`: GPU 向けの高速・省 VRAM **近似**モード。`fp32` と文字が完全一致しない場合があり、特に `rec100` 長行・`--enable-tcy` で微小差が出うる。CPU 実行時は `fp32` へ自動フォールバックし、DEIMv2 と TableCenterNet は FP32 固定） |
 | `--strict-device` | 無効 | `[追加]` 指定 GPU バックエンドの初期化・実行失敗時に CPU へフォールバックせず終了 |
 | `--check-device` | 無効 | `[追加]` 利用可能な EP・検出 GPU デバイス一覧・`--device auto` の選択結果を表示して終了 |
 | `--sourcedir` | — | 入力画像ディレクトリ (`jpg/jpeg/png/tiff/tif/jp2/bmp/webp` および PDF) |
@@ -223,7 +227,7 @@ python3 src/ocr.py --sourcepdf input.pdf --output out_dir --pdf-output out_dir/o
   - Windows: `%LOCALAPPDATA%\ndlocr-lite\models\v2`
   - macOS: `~/Library/Caches/ndlocr-lite/models/v2`
   - Linux: `${XDG_CACHE_HOME:-~/.cache}/ndlocr-lite/models/v2`
-- PARSeq 動的バッチパッチ済みモデル（`*_dynbatch_fp32_v1.onnx`）は上記キャッシュ配下の `optimized/`（環境変数 `NDLOCR_CACHE_DIR` 指定時は `$NDLOCR_CACHE_DIR/optimized/`）へ保存されます。
+- PARSeq 動的バッチ／FP16 パッチ済みモデル（`*_dynbatch_{fp32|fp16}_v1.onnx` と対応 `.meta.json` sidecar）は上記キャッシュ配下の `optimized/`（環境変数 `NDLOCR_CACHE_DIR` 指定時は `$NDLOCR_CACHE_DIR/optimized/`）へ保存されます。
 
 </details>
 
@@ -232,8 +236,9 @@ python3 src/ocr.py --sourcepdf input.pdf --output out_dir --pdf-output out_dir/o
 > **注意**: デスクトップアプリケーションは、日本語（全角文字）を含まないパスに配置してください。全角文字を含むパスでは起動しないことがあります。
 
 - **ソースから起動**: パッケージ導入後に `ndlocr-lite gui` で起動します（または `ndlocr-lite-gui/main.py` を実行）。
-- **配布ビルド**: GitHub Actions [`build-flet-cross.yml`](./.github/workflows/build-flet-cross.yml) で、Windows / Linux（各 `cuda` と `gpu-generic`）・macOS（Apple Silicon / Intel）の **6 ターゲット** をビルドしています。
-- ビルド手順の詳細は [ndlocr-lite-gui/README.md](./ndlocr-lite-gui/README.md)、GUI の基本操作は上流の [NDLOCR-Liteの使い方](https://lab.ndl.go.jp/data_set/ndlocrlite-usage/) を参照してください（本フォークでは **出力設定ダイアログ →「実行環境・GPU高速化」** と上部エンジンステータス表示を追加しています）。
+- **配布ビルド**: GitHub Actions [`build-flet-cross.yml`](./.github/workflows/build-flet-cross.yml) で、Windows / Linux（各 `cuda` と `gpu-generic`）の **4 ターゲット** をビルドしています（macOS は非提供）。
+- **起動時診断とログ**: GPU バックエンドの有効化に失敗して CPU へフォールバックした場合、画面上部の警告バナーと「環境診断」ボタンから不足ライブラリ名と対処法を確認でき、詳細ログはアプリデータディレクトリ内の `ndlocr-lite.log` に保存されます。
+- ビルド手順の詳細は [ndlocr-lite-gui/README.md](./ndlocr-lite-gui/README.md)、GUI の基本操作は上流の [NDLOCR-Liteの使い方](https://lab.ndl.go.jp/data_set/ndlocrlite-usage/) を参照してください（本フォークでは **出力設定ダイアログ →「実行環境・GPU高速化」** にデバイス・バッチサイズ・推論精度・「環境診断」を設定できます）。
 
 ---
 
@@ -251,7 +256,7 @@ flowchart LR
 ```
 
 1. **PARSeq 実行時動的バッチパッチと初期化遅延・精度ずれの解消**
-   上流の PARSeq 3 モデル（`24x256-30` / `24x384-50` / `24x768-100`）は静的 `batch=1` 構成。初回ロード時にバッチ軸 (`N`) を動的化したキャッシュ（`*_dynbatch_fp32_v1.onnx`）を生成し、`batch=1` との数値一致・`argmax` 一致を検証した上でバッチ推論する（異常時は `batch=1` へフォールバック）。動的バッチ時は ORT の `enable_mem_reuse=False` と CUDA `cudnn_conv_algo_search="HEURISTIC"` を指定して数十秒の初期化停滞を防ぎ、さらに `"use_tf32": "0"` を明示して Ampere+ GPU での TF32 精度ずれも抑止している。
+   上流の PARSeq 3 モデル（`24x256-30` / `24x384-50` / `24x768-100`）は静的 `batch=1` 構成。初回ロード時にバッチ軸 (`N`) を動的化したキャッシュ（`*_dynbatch_{fp32|fp16}_v1.onnx` と BLAKE2b 検証付き sidecar）を生成し、`batch=1` との数値一致を検証した上でバッチ推論する（破損や異常時は自動再構築または `batch=1` へフォールバック）。動的バッチ時は ORT の `enable_mem_reuse=False` と CUDA `cudnn_conv_algo_search="HEURISTIC"` を指定して数十秒の初期化停滞を防ぎ、さらに `"use_tf32": "0"` を明示して Ampere+ GPU での TF32 精度ずれも抑止している。なお `--precision fp16` は高速・省 VRAM 向けの近似モードのため、`fp32` と完全に同じ文字列にはならない場合がある（特に `rec100` や `--enable-tcy`）。
 2. **3 段パイプライン並列化**
    複数画像・PDF の処理では、次ページの画像デコードと DEIM 前処理をバックグラウンドスレッドで先読みし、出力書き出しも非同期スレッドへ逃がして GPU の待ち時間を減らしている。
 3. **Plugin EP と自動ガードによる安全なバックエンド選択**
@@ -271,7 +276,7 @@ PYTHONPATH=src:ndlocr-lite-gui .venv/bin/pytest tests ndlocr-lite-gui/tests -v
   - **ローカル Linux（最新）**: **124 passed（+ 103 subtests）**
   - **実機 Windows 11 / WSL2 Ubuntu（`c0eec1a` 時点）**: Windows 11 **100 passed, 1 skipped（+ 63 subtests）**（Windows NTFS で使用不可文字を含む POSIX ファイル名テストをスキップ） / WSL2 Ubuntu **101 passed（+ 67 subtests）**
 - **GitHub Actions CI（[ci.yml](./.github/workflows/ci.yml)）**: 履歴スナップショット（コミット `17222a9`）で全 4 ジョブ通過（`ubuntu-latest` `98 passed (+ 67 subtests)` / `windows-latest` `97 passed, 1 skipped (+ 63 subtests)`）
-- **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: コミット `3f2939a` 時点で全 6 ターゲット（Windows `cuda` / `gpu-generic`、Ubuntu `cuda` / `gpu-generic`、macOS Apple Silicon / Intel）のビルド成功と [Releases](https://github.com/melmaron/ndlocr-lite-gpu/releases/tag/2.0.0)（`2.0.0`）への公開を確認済み
+- **GitHub Actions クロスビルド（[build-flet-cross.yml](./.github/workflows/build-flet-cross.yml)）**: Windows `cuda` / `gpu-generic`、Linux `cuda` / `gpu-generic` の 4 ターゲットを成果物内容検証付きでビルド・公開（`2.0.0` 初回公開時のみ macOS 2 ターゲットも生成されていましたが実機未検証のため廃止）
 - **実機 E2E 検証（RTX 3070 8GB: Windows 11 / WSL2 Ubuntu）および Plugin EP 検証**:
   - Windows 11 / WSL2 双方で CUDA 13 (`ORT 1.31.1` + pip CUDA 13 runtime wheel) と CUDA 12 (`ORT 1.29.0`)、および Windows DirectML ハイブリッド (`ORT 1.24.4`: `DEIM CPU + PARSeq DML`) を検証し、5 画像（通常・`--enable-tcy`）と 3 ページ PDF E2E の全てで CPU `batch=1` 完全一致（差分 0）を確認済み
   - WSL2 仮想 WebGPU アダプタ (`vid=0x1414`) の `auto` スキップ・`--device webgpu` 強制時の警告、Windows `onnxruntime-ep-webgpu==0.6.0` の DXC コンパイルエラー時 CPU フォールバック、および汎用 Linux Vulkan GPU 上の WebGPU 実機推論を確認済み

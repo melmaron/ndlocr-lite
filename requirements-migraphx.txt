@@ -15,6 +15,7 @@ numpy==2.2.2
 opencv-python-headless==4.11.0.86
 onnxruntime-migraphx==1.27.1; python_version >= "3.11" and sys_platform == "linux" and platform_machine == "x86_64"
 onnxruntime==1.31.1; python_version >= "3.11" and (sys_platform != "linux" or platform_machine != "x86_64") and sys_platform != "darwin"
+# Note: Python 3.10 and macOS (darwin) are unsupported for prebuilt GUI builds; ORT 1.23.2 disables TableCenterNet (requires ORT >= 1.25).
 onnxruntime==1.23.2; python_version == "3.10" or sys_platform == "darwin"
 onnx==1.23.2; python_version >= "3.11"
 pypdf==6.21.4

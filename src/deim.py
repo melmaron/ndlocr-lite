@@ -71,6 +71,23 @@ class DEIM:
         else:
             self.markdown_styles = {}
 
+    def warmup(self) -> None:
+        """Run a dummy inference to trigger first-run kernel selection/setup."""
+        dummy = np.zeros(
+            (1, 3, int(self.input_height), int(self.input_width)),
+            dtype=self.input_dtype,
+        )
+        self.session.run(
+            self.output_names,
+            {
+                self.input_names[0]: dummy,
+                self.input_names[1]: np.array(
+                    [[int(self.input_height), int(self.input_width)]],
+                    dtype=np.int64,
+                ),
+            },
+        )
+
     def preprocess_with_meta(self, img: np.ndarray) -> Tuple[np.ndarray, int]:
         """Preprocess image without mutating instance dimensions (safe for prefetch)."""
         max_wh = max(img.shape[0], img.shape[1])

@@ -3,17 +3,15 @@
 NDLOCR-Liteの使い方を説明します。
 
 ## 起動方法
-[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases) から、お使いのOSに対応する圧縮ファイル（Windows: `ndlocr_lite_gpu_v*_windows_cuda.zip` / `..._windows_gpu_generic.zip`、Linux: `..._linux_cuda.tar.gz` / `..._linux_gpu_generic.tar.gz`、macOS: `..._macos_apple_silicon.tar.gz` / `..._macos_intel.tar.gz`）をダウンロードし、展開して `ndlocr_lite` をダブルクリック等で実行してください。
+[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases) から、お使いのOSに対応する圧縮ファイル（Windows: `ndlocr_lite_gpu_v*_windows_cuda.zip` / `..._windows_gpu_generic.zip`、Linux: `..._linux_cuda.tar.gz` / `..._linux_gpu_generic.tar.gz`）をダウンロードし、日本語（全角文字）を含まないパスへ展開して実行してください（macOS 向け配布バイナリは非提供です）。
 
-なお、セキュリティに関する警告が出ることがあります。
+### 事前要件（配布バイナリ）
+- **`cuda` 版（Windows / Linux）**: **CUDA 13 ランタイム + cuDNN 9 が別途必要（非同梱）**です。CUDA 12 のみの環境や未導入の環境では CPU にフォールバックし、画面上部の警告バナーと「環境診断」ダイアログに不足ライブラリ名と対処法が表示されます。
+- **`gpu_generic` 版**: Windows は DirectX 12 ドライバ（NVIDIA 環境では WebGPU のシェーダエラーで CPU へ落ちる場合があります）、Linux は Vulkan（`libvulkan.so.1`）+ GPU ドライバが必要です（OpenVINO は x86_64 のみ）。
+- **Linux 版共通**: GTK3 (`libgtk-3-0`) および glibc 2.35 以上（Ubuntu 22.04 以降目安）が必要です。
+- **ログ・診断**: 起動時の診断結果とフォールバック理由はアプリデータディレクトリ内の `ndlocr-lite.log` に保存されます。
 
-Windows 11の場合は、「WindowsによってPCが保護されました」→「詳細情報」→「実行」を選んでください。
-
-macOSの場合は、
-
-https://zenn.dev/nakamura196/articles/c62a465537ff20
-
-の手順に従ってください。
+なお、Windows 11 ではセキュリティに関する警告が出ることがあります。その場合は「WindowsによってPCが保護されました」→「詳細情報」→「実行」を選んでください。
 
 なお、初回の起動には1分程度時間を要することがあります。お待ちください。
 
@@ -43,7 +41,7 @@ xcopy ..\src .\src
 flet build windows
 ```
 
-### Macの場合
+### Macの場合（参考・配布バイナリ対象外／実機未検証）
 
 ```
 #(ndlocr-lite-guiと同階層で実行する)

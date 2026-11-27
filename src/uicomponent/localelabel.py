@@ -216,8 +216,8 @@ TRANSLATIONS = {
         "en":"Execution Engine & GPU Acceleration"
     },
     "customize_execution_explain":{
-        "ja":"推論デバイス（自動 / CUDA / Radeon / Arc / CPU）と並列バッチサイズを設定します。変更後すぐモデルを再読み込みします。",
-        "en":"Configure inference device (Auto / CUDA / Radeon / Arc / CPU) and batch size. Models reload automatically when changed."
+        "ja":"推論デバイス（自動 / CUDA / Radeon / Arc / CPU）、バッチサイズ、推論精度を設定します。変更後すぐモデルを再読み込みします。",
+        "en":"Configure inference device (Auto / CUDA / Radeon / Arc / CPU), batch size, and precision. Models reload automatically when changed."
     },
     "customize_device_label":{
         "ja":"実行デバイス",
@@ -226,6 +226,10 @@ TRANSLATIONS = {
     "customize_batch_size_label":{
         "ja":"バッチサイズ",
         "en":"Batch size"
+    },
+    "customize_precision_label":{
+        "ja":"推論精度",
+        "en":"Precision"
     },
     "customize_device_id_label":{
         "ja":"GPU ID",
@@ -238,6 +242,42 @@ TRANSLATIONS = {
     "engine_status_loading":{
         "ja":"実行エンジン: 読み込み中…",
         "en":"Engine: Loading…"
+    },
+    "engine_diagnostics_btn":{
+        "ja":"環境診断",
+        "en":"Diagnostics"
+    },
+    "engine_diagnostics_title":{
+        "ja":"実行環境・GPU 診断",
+        "en":"Execution Engine & GPU Diagnostics"
+    },
+    "engine_diagnostics_copy":{
+        "ja":"診断結果をコピー",
+        "en":"Copy diagnostics"
+    },
+    "engine_diagnostics_copied":{
+        "ja":"クリップボードにコピーしました",
+        "en":"Copied to clipboard"
+    },
+    "engine_diagnostics_refresh":{
+        "ja":"再診断",
+        "en":"Re-check"
+    },
+    "engine_fallback_banner_title":{
+        "ja":"GPU を利用できず CPU へフォールバックしました",
+        "en":"GPU unavailable — running on CPU fallback"
+    },
+    "engine_fallback_details_btn":{
+        "ja":"原因と対処法を見る",
+        "en":"View reason & fix"
+    },
+    "engine_log_path_label":{
+        "ja":"ログファイル",
+        "en":"Log file"
+    },
+    "table_structure_unavailable_prefix":{
+        "ja":"表構造の推定は無効",
+        "en":"Table structure estimation disabled"
     },
     "customize_save":{
         "ja":"設定を保存",

@@ -37,7 +37,7 @@ jobs:
               --draft \
               --title "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --notes "GUI デスクトップアプリケーションのビルド済みパッケージ（NDLOCR-Lite GPU fork / ${RELEASE_TAG}）。対応 OS と GPU は README のダウンロード表を参照。展開先は日本語（全角文字）を含まないパスにしてください。"
+              --notes "GUI デスクトップアプリケーションのビルド済みパッケージ（NDLOCR-Lite GPU fork / ${RELEASE_TAG}）。Windows / Linux の 4 ターゲット構成です（macOS 版は非提供）。cuda 版は CUDA 13 ランタイム + cuDNN 9 が別途必要（非同梱）、gpu_generic 版は D3D12（Windows）/ Vulkan libvulkan.so.1（Linux）が必要です（Linux 版は GTK3 / glibc 2.35+ 必要）。展開先は日本語（全角文字）を含まないパスにしてください。"
           fi
 
   cross-build:
@@ -63,14 +63,6 @@ jobs:
             variant: cuda
             target-platform: windows
             artifact-suffix: windows_cuda.zip
-          - runs-on: macos-latest
-            variant: base
-            target-platform: macos
-            artifact-suffix: macos_apple_silicon.tar.gz
-          - runs-on: macos-15-intel
-            variant: base
-            target-platform: macos
-            artifact-suffix: macos_intel.tar.gz
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: write
@@ -119,14 +111,7 @@ jobs:
           cd ndlocr-lite-gui
           cp -r ../src .
           python src/set_version.py "${BUILD_VERSION}"
-          EXTRA_ARGS=""
-          if [ "${{ matrix.runs-on }}" = "macos-15-intel" ]; then
-            echo "Intel Mac detected: Configuring specific settings..."
-            EXTRA_ARGS="--arch x86_64"
-          elif [ "${{ matrix.target-platform }}" = "macos" ]; then
-            EXTRA_ARGS="--arch arm64"
-          fi
-          flet build ${{ matrix.target-platform }} --output ../${{ matrix.target-platform }} --build-version "${BUILD_VERSION}" $EXTRA_ARGS --python-version 3.12
+          flet build ${{ matrix.target-platform }} --output ../${{ matrix.target-platform }} --build-version "${BUILD_VERSION}" --python-version 3.12
 
       - name: "Flet build(Windows)"
         if: runner.os == 'Windows'
@@ -136,8 +121,17 @@ jobs:
           echo D | xcopy ..\src .\src /E /I /Y
           python src\set_version.py "%BUILD_VERSION%"
           set PYTHONUTF8=1
-          flet build ${{ matrix.target-platform }} --output ..\${{ matrix.target-platform }} --build-version "%BUILD_VERSION%"
+          flet build ${{ matrix.target-platform }} --output ..\${{ matrix.target-platform }} --build-version "%BUILD_VERSION%" --python-version 3.12
           copy main.py ..\${{ matrix.target-platform }}
+
+      - name: "Verify build artifact contents"
+        shell: bash
+        run: |
+          python scripts/verify_flet_artifact.py \
+            --output-dir "${{ matrix.target-platform }}" \
+            --platform "${{ matrix.target-platform }}" \
+            --variant "${{ matrix.variant }}" \
+            --python-version 3.12
 
       - name: "Linux/MacOS compress"
         if: runner.os != 'Windows'
