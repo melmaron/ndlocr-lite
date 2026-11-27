@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Build version string (e.g. 2.0.2)"
+        description: "Build version string (e.g. 2.0.3)"
         required: true
-        default: "2.0.2"
+        default: "2.0.3"
         type: string
       create_release:
         description: "Create/publish a GitHub Release (disable for test builds)"

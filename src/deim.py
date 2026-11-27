@@ -258,4 +258,5 @@ class DEIM:
                 continue
             color = self.colorlist[class_id]
             draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
-        pil_image.save(outputimgpath)
+        save_kwargs = {"compress_level": 1} if str(outputimgpath).lower().endswith(".png") else {}
+        pil_image.save(outputimgpath, **save_kwargs)

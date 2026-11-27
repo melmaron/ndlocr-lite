@@ -56,15 +56,17 @@ def write_pdf_page_outputs(
     convert_tei_func=None,
     include_xml_in_json: bool = False,
     source_dpi: float | None = None,
+    page_json_obj: dict | None = None,
 ) -> dict:
     page_output_stem = build_pdf_page_output_stem(output_stem, page_index)
-    page_json_obj = build_pdf_page_json_obj(
-        page_result,
-        source_path=source_path,
-        include_xml=include_xml_in_json,
-        source_page_index=page_index,
-        source_dpi=source_dpi,
-    )
+    if page_json_obj is None:
+        page_json_obj = build_pdf_page_json_obj(
+            page_result,
+            source_path=source_path,
+            include_xml=include_xml_in_json,
+            source_page_index=page_index,
+            source_dpi=source_dpi,
+        )
 
     if write_xml:
         with open(os.path.join(output_dir, page_output_stem + ".xml"), "w", encoding="utf-8") as wf:

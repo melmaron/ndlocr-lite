@@ -994,7 +994,8 @@ def inference_on_detector(args,inputname:str,npimage:np.ndarray,outputpath:str,i
         if output_filepath.split(".")[-1]=="jp2":
             output_filepath=output_filepath[:-4]+".jpg"
         print(f"[INFO] Saving result on {output_filepath}")
-        pil_image.save(output_filepath)
+        save_kwargs = {"compress_level": 1} if output_filepath.lower().endswith(".png") else {}
+        pil_image.save(output_filepath, **save_kwargs)
     return detections,classeslist
 
 def _save_viz_image(detector, outputpath: str, inputname: str, npimage: np.ndarray, detections) -> None:
@@ -1005,7 +1006,8 @@ def _save_viz_image(detector, outputpath: str, inputname: str, npimage: np.ndarr
     if output_filepath.split(".")[-1] == "jp2":
         output_filepath = output_filepath[:-4] + ".jpg"
     print(f"[INFO] Saving result on {output_filepath}")
-    pil_image.save(output_filepath)
+    save_kwargs = {"compress_level": 1} if output_filepath.lower().endswith(".png") else {}
+    pil_image.save(output_filepath, **save_kwargs)
 
 
 def process_detector(detector,inputname:str,npimage:np.ndarray,outputpath:str,issaveimg:bool=True,preprocessed=None):

@@ -13,7 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
 import xml.etree.ElementTree as ET
+
+_TEI_NS_LOCK = threading.Lock()
+_TEI_NS_REGISTERED = False
+
+
+def _ensure_tei_namespaces(ns: dict[str, str]) -> None:
+    """Register TEI/XML namespaces once under a lock for thread-safe Stage 3 writes."""
+    global _TEI_NS_REGISTERED
+    if _TEI_NS_REGISTERED:
+        return
+    with _TEI_NS_LOCK:
+        if _TEI_NS_REGISTERED:
+            return
+        ET.register_namespace('', ns['tei'])
+        ET.register_namespace('xml', ns['xml'])
+        _TEI_NS_REGISTERED = True
+
 
 xmltemplate="""<?xml version="1.0" encoding="UTF-8"?>
 <?xml-model href="http://www.tei-c.org/release/xml/tei/custom/schema/relaxng/tei_all.rng" type="application/xml" schematypens="http://relaxng.org/ns/structure/1.0"?>
@@ -54,9 +72,7 @@ def convert_tei(ndl_jsons):
     root = ET.fromstring(xmltemplate)
     ns = {'tei': 'http://www.tei-c.org/ns/1.0',
           'xml': 'http://www.w3.org/XML/1998/namespace'}
-    
-    ET.register_namespace('', ns['tei'])
-    ET.register_namespace('xml', ns['xml'])
+    _ensure_tei_namespaces(ns)
 
     el_body_p = root.find('tei:text', ns).find('tei:body', ns).find('tei:p', ns)
     el_facsimile = root.find('tei:facsimile', ns)

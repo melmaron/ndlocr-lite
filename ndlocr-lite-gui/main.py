@@ -38,8 +38,22 @@ import math
 from io import BytesIO
 if __package__:
     from .gui_config import build_default_config
+    from .pipeline_utils import (
+        BoundedAsyncWriter,
+        ImagePrefetcher,
+        PdfPagePrefetcher,
+        default_max_pending_writes,
+        default_writer_workers,
+    )
 else:
     from gui_config import build_default_config
+    from pipeline_utils import (
+        BoundedAsyncWriter,
+        ImagePrefetcher,
+        PdfPagePrefetcher,
+        default_max_pending_writes,
+        default_writer_workers,
+    )
 from uicomponent.localelabel import TRANSLATIONS
 from uicomponent.textdaisy import TextDaisyExporter
 from collections import Counter
@@ -55,7 +69,11 @@ from ort_provider import (
     prepare_backend_for_parallel_init,
     should_parallelize_model_init,
 )
-from pdf_output_utils import should_output_pdf_pages_separately, write_pdf_page_outputs
+from pdf_output_utils import (
+    build_pdf_page_json_obj,
+    should_output_pdf_pages_separately,
+    write_pdf_page_outputs,
+)
 from character_inclusion import apply_character_inclusion
 from html_output import build_html_document
 from version import __version__
@@ -88,6 +106,7 @@ convert_tei = None
 categories_org_name_index = None
 _runtime_modules_lock = threading.Lock()
 _runtime_modules_ready = False
+_REPORTLAB_LOCK = threading.Lock()
 
 
 def load_runtime_modules():
@@ -483,18 +502,169 @@ def load_rgb_image_array(input_path: str) -> 'np.ndarray':
 
 
 def render_pdf_page_array(pdf_path: str, page_index: int, scale: float) -> 'np.ndarray':
-    """Render one PDF page without sharing PDFium objects between threads."""
+    """Render one PDF page via binary stream without sharing PDFium objects across threads."""
     load_runtime_modules()
-    pdf_doc = pypdfium2.PdfDocument(pdf_path)
-    try:
-        rendered_pages = pdf_doc.render(
-            pypdfium2.PdfBitmap.to_pil,
-            page_indices=[page_index],
-            scale=scale,
+    with Path(pdf_path).open('rb') as pdf_stream:
+        pdf_doc = pypdfium2.PdfDocument(pdf_stream)
+        try:
+            rendered_pages = pdf_doc.render(
+                pypdfium2.PdfBitmap.to_pil,
+                page_indices=[page_index],
+                scale=scale,
+            )
+            pil_page = next(iter(rendered_pages))
+            try:
+                rgb_page = pil_page.convert('RGB')
+                try:
+                    return np.array(rgb_page, copy=True)
+                finally:
+                    if rgb_page is not pil_page and callable(getattr(rgb_page, 'close', None)):
+                        rgb_page.close()
+            finally:
+                if callable(getattr(pil_page, 'close', None)):
+                    pil_page.close()
+        finally:
+            pdf_doc.close()
+
+
+def _write_pdf_page_task(
+    *,
+    output_dir: str,
+    output_stem: str,
+    page_index: int,
+    page_name: str,
+    img,
+    page_result: dict,
+    page_json_obj: dict,
+    source_path: str,
+    source_dpi: float,
+    separate_page_outputs: bool,
+    write_json: bool,
+    write_xml: bool,
+    write_txt: bool,
+    write_tei: bool,
+    write_html: bool,
+    write_viz: bool,
+    page_tables: list,
+    detector,
+    categories_mapping: dict,
+    convert_tei_func,
+    build_html_fn,
+) -> str | None:
+    """Write Stage 3 per-page PDF artifacts and optional visualization image."""
+    if separate_page_outputs and (write_json or write_xml or write_txt or write_tei):
+        write_pdf_page_outputs(
+            output_dir,
+            output_stem,
+            page_index,
+            page_result,
+            source_path=source_path,
+            write_json=write_json,
+            write_xml=write_xml,
+            write_txt=write_txt,
+            write_tei=write_tei,
+            convert_tei_func=convert_tei_func if write_tei else None,
+            include_xml_in_json=True,
+            source_dpi=source_dpi,
+            page_json_obj=page_json_obj,
         )
-        return np.asarray(next(iter(rendered_pages)).convert('RGB'))
-    finally:
-        pdf_doc.close()
+    if write_html and separate_page_outputs:
+        Path(output_dir, f'{output_stem}_{page_index + 1:05}.html').write_text(
+            build_html_fn(page_name, [(page_result, page_tables)]),
+            encoding='utf-8',
+        )
+    if write_viz:
+        viz_path = os.path.join(output_dir, f'viz_{page_name}')
+        detector.drawxml_detections(
+            npimg=img,
+            xmlstr='<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>',
+            categories=categories_mapping,
+            outputimgpath=viz_path,
+        )
+        if os.path.exists(viz_path):
+            return viz_path
+    return None
+
+
+def _write_image_page_task(
+    *,
+    inputpath: str,
+    imgname: str,
+    outputpath: str,
+    output_stem: str,
+    img,
+    allxmlstr: str,
+    alltextlist: list,
+    resjsonarray: list,
+    alljsonobj: dict,
+    page_result: dict,
+    page_tables: list,
+    output_markdown: str,
+    write_xml: bool,
+    write_viz: bool,
+    write_json: bool,
+    write_txt: bool,
+    write_markdown: bool,
+    write_html: bool,
+    write_pdf: bool,
+    pdf_viztxt: bool,
+    pdf_resolution: int,
+    detector,
+    categories_mapping: dict,
+    build_html_fn,
+    create_pdf_fn,
+) -> tuple[str | None, str | None]:
+    """Write Stage 3 artifacts for a single image file."""
+    viz_result: str | None = None
+    pdf_result: str | None = None
+
+    if write_xml:
+        with open(os.path.join(outputpath, output_stem + '.xml'), 'w', encoding='utf-8') as wf:
+            wf.write(allxmlstr)
+
+    if write_viz:
+        output_vizpath = os.path.join(outputpath, 'viz_' + os.path.basename(inputpath))
+        if output_vizpath.split('.')[-1] == 'jp2':
+            output_vizpath = output_vizpath[:-4] + '.jpg'
+        detector.drawxml_detections(
+            npimg=img,
+            xmlstr=allxmlstr,
+            categories=categories_mapping,
+            outputimgpath=output_vizpath,
+        )
+        if os.path.exists(output_vizpath):
+            viz_result = output_vizpath
+
+    if write_json:
+        with open(os.path.join(outputpath, output_stem + '.json'), 'w', encoding='utf-8') as wf:
+            wf.write(json.dumps(alljsonobj, ensure_ascii=False, indent=2))
+
+    if write_txt:
+        with open(os.path.join(outputpath, output_stem + '.txt'), 'w', encoding='utf-8') as wtf:
+            wtf.write('\n'.join(alltextlist))
+
+    if write_markdown:
+        with open(os.path.join(outputpath, output_stem + '.md'), 'w', encoding='utf-8') as wf:
+            wf.write(output_markdown)
+
+    if write_html:
+        Path(outputpath, output_stem + '.html').write_text(
+            build_html_fn(imgname, [(page_result, page_tables)]),
+            encoding='utf-8',
+        )
+
+    if write_pdf:
+        pdf_outpath = os.path.join(outputpath, output_stem + '.pdf')
+        create_pdf_fn(
+            pdf_outpath,
+            img,
+            resjsonarray,
+            pdf_viztxt,
+            resolution=pdf_resolution,
+        )
+        pdf_result = pdf_outpath
+
+    return viz_result, pdf_result
 
 
 class ImageSelector:
@@ -770,6 +940,7 @@ class ImageSelector:
                 outputpath=self.outputdirpath or os.getcwd(),
                 save_viz=False,
                 text_transform=get_character_inclusion_transform(self.config_obj),
+                include_markdown=False,
             )
             page_tables = []
             if (
@@ -1114,6 +1285,7 @@ class CaptureTool:
                 outputpath=self.outputdirpath,
                 save_viz=False,
                 text_transform=get_character_inclusion_transform(self.config_obj),
+                include_markdown=False,
             )
             page_tables = []
             if (
@@ -2082,65 +2254,64 @@ def main(page: ft.Page, args=None, download_models=False):
             page_w = img_w * 72.0 / dpi
             page_h = img_h * 72.0 / dpi
 
-            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3', isVertical=True))
-            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5', isVertical=False))
-
-            c = canvas.Canvas(outputpath, pagesize=(page_w, page_h))
-
             pilimg_data = io.BytesIO()
-            pilimg=Image.fromarray(img)
+            pilimg = Image.fromarray(img)
             if pilimg.mode in ("RGBA", "LA", "P"):
                 pilimg = pilimg.convert("RGB")
-            #Image.fromarray(img).save(pilimg_data, format='PNG')
             try:
                 pilimg.save(pilimg_data, format='JPEG')
-            except:
+            except Exception:
                 pilimg.save(pilimg_data, format='PNG')
             pilimg_data.seek(0)
 
-            c.drawImage(
-                ImageReader(pilimg_data),
-                0,
-                0,
-                width=page_w,
-                height=page_h,
-                preserveAspectRatio=False,
-                mask=None,
-            )
+            with _REPORTLAB_LOCK:
+                pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3', isVertical=True))
+                pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5', isVertical=False))
 
-            if viztxtflag:
-                c.setFillAlpha(1)
-                c.setFillColor(blue)
-            else:
-                c.setFillAlpha(0)
-
-            for bboxobj in bboxlistobj:
-                text = bboxobj.get('text', '')
-                if not text:
-                    continue
-                bbox = bboxobj['boundingBox']
-                xmin = bbox[0][0]
-                ymin = bbox[0][1]
-                line_w = bbox[2][0] - bbox[0][0]
-                line_h = bbox[1][1] - bbox[0][1]
-                line = {
-                    'x': xmin,
-                    'y': ymin,
-                    'width': line_w,
-                    'height': line_h,
-                    'text': text,
-                    'is_vertical': line_h > line_w,
-                }
-                ocr._draw_text_layer_line(
-                    canvas_obj=c,
-                    line=line,
-                    img_width=img_w,
-                    img_height=img_h,
-                    page_width=page_w,
-                    page_height=page_h,
-                    visible=viztxtflag,
+                c = canvas.Canvas(outputpath, pagesize=(page_w, page_h))
+                c.drawImage(
+                    ImageReader(pilimg_data),
+                    0,
+                    0,
+                    width=page_w,
+                    height=page_h,
+                    preserveAspectRatio=False,
+                    mask=None,
                 )
-            c.save()
+
+                if viztxtflag:
+                    c.setFillAlpha(1)
+                    c.setFillColor(blue)
+                else:
+                    c.setFillAlpha(0)
+
+                for bboxobj in bboxlistobj:
+                    text = bboxobj.get('text', '')
+                    if not text:
+                        continue
+                    bbox = bboxobj['boundingBox']
+                    xmin = bbox[0][0]
+                    ymin = bbox[0][1]
+                    line_w = bbox[2][0] - bbox[0][0]
+                    line_h = bbox[1][1] - bbox[0][1]
+                    line = {
+                        'x': xmin,
+                        'y': ymin,
+                        'width': line_w,
+                        'height': line_h,
+                        'text': text,
+                        'is_vertical': line_h > line_w,
+                    }
+                    ocr._draw_text_layer_line(
+                        canvas_obj=c,
+                        line=line,
+                        img_width=img_w,
+                        img_height=img_h,
+                        page_width=page_w,
+                        page_height=page_h,
+                        visible=viztxtflag,
+                    )
+                c.save()
 
         def is_pdf_tmp_path(path: str) -> bool:
             try:
@@ -2152,21 +2323,22 @@ def main(page: ft.Page, args=None, download_models=False):
         def render_pdf_preview(pdf_path: str, filestem: str):
             load_runtime_modules()
             os.makedirs(PDFTMPPATH, exist_ok=True)
-            doc = pypdfium2.PdfDocument(pdf_path)
-            try:
-                for ix in range(len(doc)):
-                    rendered = doc.render(
-                        pypdfium2.PdfBitmap.to_pil,
-                        page_indices=[ix],
-                        scale=100 / 72,
-                    )
-                    image = next(iter(rendered)).convert('RGB')
-                    outputtmppath = os.path.join(PDFTMPPATH, '{}_{:05}.jpg'.format(filestem, ix))
-                    inputpathlist.append(outputtmppath)
-                    image.save(outputtmppath)
-                    image.close()
-            finally:
-                doc.close()
+            with Path(pdf_path).open('rb') as pdf_stream:
+                doc = pypdfium2.PdfDocument(pdf_stream)
+                try:
+                    for ix in range(len(doc)):
+                        rendered = doc.render(
+                            pypdfium2.PdfBitmap.to_pil,
+                            page_indices=[ix],
+                            scale=100 / 72,
+                        )
+                        image = next(iter(rendered)).convert('RGB')
+                        outputtmppath = os.path.join(PDFTMPPATH, '{}_{:05}.jpg'.format(filestem, ix))
+                        inputpathlist.append(outputtmppath)
+                        image.save(outputtmppath)
+                        image.close()
+                finally:
+                    doc.close()
 
         def models_are_ready():
             return all((
@@ -2244,8 +2416,15 @@ def main(page: ft.Page, args=None, download_models=False):
             output_stem = pdf_path_obj.stem
             render_dpi = parse_pdf_dpi(pdf_resolution_textfield.value)
             render_scale = render_dpi / 72.0
+            pdf_started_at = time.perf_counter()
 
-            pdf_doc = pypdfium2.PdfDocument(str(pdf_path_obj))
+            with pdf_path_obj.open('rb') as pdf_stream:
+                pdf_doc_meta = pypdfium2.PdfDocument(pdf_stream)
+                try:
+                    page_count = len(pdf_doc_meta)
+                finally:
+                    pdf_doc_meta.close()
+
             page_results = []
             all_json_contents = []
             page_infos = []
@@ -2255,75 +2434,118 @@ def main(page: ft.Page, args=None, download_models=False):
             all_page_xml = []
             tei_jsonobjlist = []
 
+            separate_page_outputs = should_output_pdf_pages_separately(
+                page_count,
+                config_obj.get('pdf_page_output', True),
+            )
+            write_json = bool(chkbx_json.value)
+            write_xml = bool(chkbx_xml.value)
+            write_txt = bool(chkbx_txt.value)
+            write_tei = bool(chkbx_tei.value)
+            write_html = bool(chkbx_html.value)
+            write_markdown = bool(chkbx_markdown.value)
+            write_viz = bool(chkbx_visualize.value)
+            write_pdf = bool(chkbx_pdf.value)
+            pdf_viztxt = bool(chkbx_pdf_viztxt.value)
+            table_enabled = bool(
+                TABLE_STRUCTURE_FEATURE is not None
+                and chkbx_table_structure is not None
+                and chkbx_table_structure.value
+                and origin_table_recognizer is not None
+            )
+            text_transform = get_character_inclusion_transform(config_obj)
+            writer_workers = default_writer_workers()
+            max_pending_writes = default_max_pending_writes(writer_workers)
+
+            prefetcher = PdfPagePrefetcher(
+                pdf_path=str(pdf_path_obj),
+                page_count=page_count,
+                render_scale=render_scale,
+                detector=origin_detector,
+                prefetch_size=3,
+                cancel_event=ocr_cancel_event,
+                pdfium_module=pypdfium2,
+                np_module=np,
+            )
+            writer = BoundedAsyncWriter(
+                max_workers=writer_workers,
+                max_pending=max_pending_writes,
+                thread_name_prefix='gui-pdf-writer',
+            )
+
+            processed_pages = 0
+            completed = True
+            suppress_writer_errors = False
+            last_ui_update = time.monotonic()
+
+            def _on_pdf_page_written(viz_result):
+                if viz_result:
+                    visualizepathlist.append(viz_result)
+
             try:
-                page_count = len(pdf_doc)
-                separate_page_outputs = should_output_pdf_pages_separately(
-                    page_count,
-                    config_obj.get('pdf_page_output', True),
-                )
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix='gui-pdf-prefetch') as prefetch_pool:
-                    next_page_future = (
-                        prefetch_pool.submit(
-                            render_pdf_page_array,
-                            str(pdf_path_obj),
-                            0,
-                            render_scale,
-                        )
-                        if page_count > 0
-                        else None
-                    )
-                    for page_index in range(page_count):
+                while True:
+                    if ocr_cancel_event.is_set():
+                        completed = False
+                        suppress_writer_errors = True
+                        break
+
+                    item = await prefetcher.next_page()
+                    if item is None:
                         if ocr_cancel_event.is_set():
-                            return page_index, False, tei_jsonobjlist
-                        page_name = f'{output_stem}_{page_index + 1:05}.png'
-                        set_progress_message(f'{pdf_path_obj.name} page {page_index + 1}/{page_count}')
+                            completed = False
+                            suppress_writer_errors = True
+                        break
+
+                    if ocr_cancel_event.is_set():
+                        completed = False
+                        suppress_writer_errors = True
+                        break
+
+                    page_index, img, det_pre = item
+                    page_name = f'{output_stem}_{page_index + 1:05}.png'
+                    set_progress_message(f'{pdf_path_obj.name} page {page_index + 1}/{page_count}')
+                    now_ui = time.monotonic()
+                    if page_index == 0 or (now_ui - last_ui_update) >= 0.1:
                         progressmessage.update()
+                        last_ui_update = now_ui
 
-                        img = await asyncio.wrap_future(next_page_future)
-                        if page_index + 1 < page_count and not ocr_cancel_event.is_set():
-                            next_page_future = prefetch_pool.submit(
-                                render_pdf_page_array,
-                                str(pdf_path_obj),
-                                page_index + 1,
-                                render_scale,
-                            )
-                        else:
-                            next_page_future = None
+                    page_result = await asyncio.to_thread(
+                        ocr._run_ocr_on_image_array,
+                        detector=origin_detector,
+                        recognizer30=origin_recognizer30,
+                        recognizer50=origin_recognizer50,
+                        recognizer100=origin_recognizer,
+                        inputname=page_name,
+                        img=img,
+                        outputpath=outputpath,
+                        save_viz=False,
+                        text_transform=text_transform,
+                        preprocessed_det=det_pre,
+                        include_markdown=False,
+                    )
 
-                        page_result = await asyncio.to_thread(
-                            ocr._run_ocr_on_image_array,
-                            detector=origin_detector,
-                            recognizer30=origin_recognizer30,
-                            recognizer50=origin_recognizer50,
-                            recognizer100=origin_recognizer,
-                            inputname=page_name,
-                            img=img,
-                            outputpath=outputpath,
-                            save_viz=False,
-                            text_transform=get_character_inclusion_transform(config_obj),
+                    page_tables = []
+                    if table_enabled:
+                        page_result, page_tables = await asyncio.to_thread(
+                            TABLE_STRUCTURE_FEATURE.infer,
+                            img,
+                            page_result,
+                            origin_table_recognizer,
+                            args.table_crop_padding,
                         )
-
-                        page_tables = []
-                        if (
-                            TABLE_STRUCTURE_FEATURE is not None
-                            and chkbx_table_structure is not None
-                            and chkbx_table_structure.value
-                            and origin_table_recognizer is not None
-                        ):
-                            page_result, page_tables = await asyncio.to_thread(
-                                TABLE_STRUCTURE_FEATURE.infer,
-                                img,
-                                page_result,
-                                origin_table_recognizer,
-                                args.table_crop_padding,
-                            )
+                        if page_tables:
                             for table_item in page_tables:
                                 table_item['page_index'] = page_index
-                            TABLE_STRUCTURE_FEATURE.write_html_files(
-                                pdf_path_obj.name, page_tables, outputpath, output_stem,
+                            await asyncio.to_thread(
+                                TABLE_STRUCTURE_FEATURE.write_html_files,
+                                pdf_path_obj.name,
+                                page_tables,
+                                outputpath,
+                                output_stem,
                             )
 
-                        page_results.append(page_result)
+                    page_results.append(page_result)
+                    if not separate_page_outputs:
                         all_json_contents.append(page_result['json_lines'])
                         page_infos.append({
                             'page_index': page_index,
@@ -2332,68 +2554,96 @@ def main(page: ft.Page, args=None, download_models=False):
                             'img_name': page_result['img_name'],
                         })
                         all_text_pages.append(page_result['text'])
-                        page_markdown = build_gui_result_markdown(page_result, page_tables)
-                        output_markdown = build_output_result_markdown(page_result, page_tables)
-                        all_markdown_pages.append(output_markdown)
-                        html_pages.append((page_result, page_tables))
-                        if chkbx_html.value and separate_page_outputs:
-                            Path(outputpath, f'{output_stem}_{page_index + 1:05}.html').write_text(
-                                build_output_result_html(page_name, [(page_result, page_tables)]),
-                                encoding='utf-8',
-                            )
-                        outputplaintextlist.append(page_result['text'])
-                        outputtxtlist.append(page_markdown)
                         all_page_xml.append(page_result['page_xml'])
 
-                        page_json_obj = write_pdf_page_outputs(
-                            outputpath,
-                            output_stem,
-                            page_index,
-                            page_result,
-                            source_path=str(pdf_path_obj),
-                            write_json=separate_page_outputs and chkbx_json.value,
-                            write_xml=separate_page_outputs and chkbx_xml.value,
-                            write_txt=separate_page_outputs and chkbx_txt.value,
-                            write_tei=separate_page_outputs and chkbx_tei.value,
-                            convert_tei_func=convert_tei if chkbx_tei.value else None,
-                            include_xml_in_json=True,
-                            source_dpi=render_dpi,
+                    page_markdown = build_gui_result_markdown(page_result, page_tables)
+                    if write_markdown:
+                        output_markdown = (
+                            build_output_result_markdown(page_result, page_tables)
+                            if page_tables
+                            else page_markdown
                         )
-                        alljsonobjlist.append(page_json_obj)
-                        if not separate_page_outputs:
-                            tei_jsonobjlist.append(page_json_obj)
+                        all_markdown_pages.append(output_markdown)
+                    if write_html and not separate_page_outputs:
+                        html_pages.append((page_result, page_tables))
 
-                        if chkbx_visualize.value:
-                            viz_path = os.path.join(outputpath, f'viz_{page_name}')
-                            await asyncio.to_thread(
-                                origin_detector.drawxml_detections,
-                                npimg=img,
-                                xmlstr='<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>',
-                                categories=categories_org_name_index,
-                                outputimgpath=viz_path,
-                            )
-                            if os.path.exists(viz_path):
-                                visualizepathlist.append(viz_path)
+                    outputplaintextlist.append(page_result['text'])
+                    outputtxtlist.append(page_markdown)
 
-                        progressbar.value += 1 / max(allsum, 1)
+                    page_json_obj = build_pdf_page_json_obj(
+                        page_result,
+                        source_path=str(pdf_path_obj),
+                        include_xml=True,
+                        source_page_index=page_index,
+                        source_dpi=render_dpi,
+                    )
+                    alljsonobjlist.append(page_json_obj)
+                    if not separate_page_outputs:
+                        tei_jsonobjlist.append(page_json_obj)
+
+                    await writer.submit(
+                        _write_pdf_page_task,
+                        output_dir=outputpath,
+                        output_stem=output_stem,
+                        page_index=page_index,
+                        page_name=page_name,
+                        img=img,
+                        page_result=page_result,
+                        page_json_obj=page_json_obj,
+                        source_path=str(pdf_path_obj),
+                        source_dpi=render_dpi,
+                        separate_page_outputs=separate_page_outputs,
+                        write_json=write_json,
+                        write_xml=write_xml,
+                        write_txt=write_txt,
+                        write_tei=write_tei,
+                        write_html=write_html,
+                        write_viz=write_viz,
+                        page_tables=page_tables,
+                        detector=origin_detector,
+                        categories_mapping=categories_org_name_index,
+                        convert_tei_func=convert_tei,
+                        build_html_fn=build_output_result_html,
+                        on_complete=_on_pdf_page_written,
+                    )
+
+                    processed_pages += 1
+                    progressbar.value += 1 / max(allsum, 1)
+                    now_ui = time.monotonic()
+                    if (
+                        page_index == 0
+                        or page_index == page_count - 1
+                        or (now_ui - last_ui_update) >= 0.1
+                    ):
                         page.update()
-            finally:
-                pdf_doc.close()
+                        last_ui_update = now_ui
 
-            if chkbx_xml.value and not separate_page_outputs:
+                if completed:
+                    writer.flush_completed()
+            except BaseException:
+                suppress_writer_errors = True
+                raise
+            finally:
+                prefetcher.close()
+                await writer.close(suppress_errors=suppress_writer_errors)
+
+            if not completed:
+                return processed_pages, False, tei_jsonobjlist
+
+            if write_xml and not separate_page_outputs:
                 with open(os.path.join(outputpath, output_stem + '.xml'), 'w', encoding='utf-8') as wf:
                     wf.write('<OCRDATASET>\n')
                     wf.write('\n'.join(all_page_xml))
                     wf.write('\n</OCRDATASET>')
 
-            if chkbx_txt.value and not separate_page_outputs:
+            if write_txt and not separate_page_outputs:
                 with open(os.path.join(outputpath, output_stem + '.txt'), 'w', encoding='utf-8') as wf:
                     wf.write('\n\n'.join(all_text_pages))
 
-            if chkbx_markdown.value:
+            if write_markdown:
                 with open(os.path.join(outputpath, output_stem + '.md'), 'w', encoding='utf-8') as wf:
                     wf.write('\n\n---\n\n'.join(all_markdown_pages))
-            if chkbx_html.value and not separate_page_outputs:
+            if write_html and not separate_page_outputs:
                 Path(outputpath, output_stem + '.html').write_text(
                     build_output_result_html(pdf_path_obj.name, html_pages), encoding='utf-8',
                 )
@@ -2409,20 +2659,32 @@ def main(page: ft.Page, args=None, download_models=False):
                 'pages': page_infos,
             }
 
-            if chkbx_json.value and not separate_page_outputs:
+            if write_json and not separate_page_outputs:
                 with open(os.path.join(outputpath, output_stem + '.json'), 'w', encoding='utf-8') as wf:
                     wf.write(json.dumps(pdf_json_obj, ensure_ascii=False, indent=2))
 
-            if chkbx_pdf.value:
+            if write_pdf and page_results:
                 output_pdf = os.path.join(outputpath, output_stem + '_text.pdf')
                 await asyncio.to_thread(
                     ocr.embed_text_layer_pdf,
                     input_pdf=str(pdf_path_obj),
                     output_pdf=output_pdf,
                     page_results=page_results,
-                    visible_text=chkbx_pdf_viztxt.value,
+                    visible_text=pdf_viztxt,
                 )
                 pdf_outpath_list.append(output_pdf)
+
+            pdf_elapsed = max(time.perf_counter() - pdf_started_at, 1e-6)
+            LOGGER.info(
+                'Completed PDF OCR: file=%s | pages=%d | elapsed=%.2fs (%.2f p/s) | dpi=%.0f | viz=%s | writers=%d',
+                pdf_path_obj.name,
+                processed_pages,
+                pdf_elapsed,
+                processed_pages / pdf_elapsed,
+                render_dpi,
+                write_viz,
+                writer_workers,
+            )
 
             return page_count, True, tei_jsonobjlist
 
@@ -2471,9 +2733,12 @@ def main(page: ft.Page, args=None, download_models=False):
                 allsum = len(standalone_inputpathlist)
                 for pdf_path in pdf_job_list:
                     try:
-                        pdf_doc_tmp = pypdfium2.PdfDocument(pdf_path)
-                        allsum += len(pdf_doc_tmp)
-                        pdf_doc_tmp.close()
+                        with Path(pdf_path).open('rb') as pdf_stream:
+                            pdf_doc_tmp = pypdfium2.PdfDocument(pdf_stream)
+                            try:
+                                allsum += len(pdf_doc_tmp)
+                            finally:
+                                pdf_doc_tmp.close()
                     except Exception:
                         allsum += 1
 
@@ -2496,148 +2761,203 @@ def main(page: ft.Page, args=None, download_models=False):
                         cancelled = True
                         break
 
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix='gui-img-prefetch') as img_prefetch_pool:
-                    next_img_future = (
-                        img_prefetch_pool.submit(load_rgb_image_array, standalone_inputpathlist[0])
-                        if standalone_inputpathlist
-                        else None
+                if standalone_inputpathlist and not cancelled:
+                    write_xml = bool(chkbx_xml.value)
+                    write_viz = bool(chkbx_visualize.value)
+                    write_json = bool(chkbx_json.value)
+                    write_txt = bool(chkbx_txt.value)
+                    write_markdown = bool(chkbx_markdown.value)
+                    write_html = bool(chkbx_html.value)
+                    write_pdf = bool(chkbx_pdf.value)
+                    pdf_viztxt = bool(chkbx_pdf_viztxt.value)
+                    pdf_resolution = int(parse_pdf_dpi(pdf_resolution_textfield.value))
+                    table_enabled = bool(
+                        TABLE_STRUCTURE_FEATURE is not None
+                        and chkbx_table_structure is not None
+                        and chkbx_table_structure.value
+                        and origin_table_recognizer is not None
                     )
-                    for idx, inputpath in enumerate(standalone_inputpathlist):
-                        if ocr_cancel_event.is_set():
-                            cancelled=True
-                            break
-                        set_progress_message(inputpath)
-                        progressmessage.update()
-                        img = await asyncio.wrap_future(next_img_future)
-                        if idx + 1 < len(standalone_inputpathlist) and not ocr_cancel_event.is_set():
-                            next_img_future = img_prefetch_pool.submit(
-                                load_rgb_image_array,
-                                standalone_inputpathlist[idx + 1],
-                            )
-                        else:
-                            next_img_future = None
-                        start = time.time()
-                        img_h, img_w = img.shape[:2]
-                        imgname = os.path.basename(inputpath)
+                    text_transform = get_character_inclusion_transform(config_obj)
+                    img_writer_workers = default_writer_workers()
+                    img_max_pending = default_max_pending_writes(img_writer_workers)
+                    img_prefetcher = ImagePrefetcher(
+                        paths=standalone_inputpathlist,
+                        load_image_fn=load_rgb_image_array,
+                        detector=origin_detector,
+                        prefetch_size=3,
+                        cancel_event=ocr_cancel_event,
+                    )
+                    img_writer = BoundedAsyncWriter(
+                        max_workers=img_writer_workers,
+                        max_pending=img_max_pending,
+                        thread_name_prefix='gui-img-writer',
+                    )
+                    img_loop_failed = False
+                    last_img_ui_update = time.monotonic()
 
-                        page_result = await asyncio.to_thread(
-                            ocr._run_ocr_on_image_array,
-                            detector=origin_detector,
-                            recognizer30=origin_recognizer30,
-                            recognizer50=origin_recognizer50,
-                            recognizer100=origin_recognizer,
-                            inputname=imgname,
-                            img=img,
-                            outputpath=outputpath,
-                            save_viz=False,
-                            text_transform=get_character_inclusion_transform(config_obj),
-                        )
+                    def _on_image_page_written(result):
+                        viz_res, pdf_res = result
+                        if viz_res:
+                            visualizepathlist.append(viz_res)
+                        if pdf_res:
+                            pdf_outpath_list.append(pdf_res)
 
-                        page_tables = []
-                        if (
-                            TABLE_STRUCTURE_FEATURE is not None
-                            and chkbx_table_structure is not None
-                            and chkbx_table_structure.value
-                            and origin_table_recognizer is not None
-                        ):
-                            page_result, page_tables = await asyncio.to_thread(
-                                TABLE_STRUCTURE_FEATURE.infer,
-                                img,
-                                page_result,
-                                origin_table_recognizer,
-                                args.table_crop_padding,
-                            )
+                    try:
+                        while True:
+                            if ocr_cancel_event.is_set():
+                                cancelled = True
+                                break
+                            prefetched = await img_prefetcher.next_item()
+                            if prefetched is None:
+                                if ocr_cancel_event.is_set():
+                                    cancelled = True
+                                break
+                            if ocr_cancel_event.is_set():
+                                cancelled = True
+                                break
 
-                        allxmlstr = '<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>'
-                        alltextlist = [page_result['text']]
-                        resjsonarray = page_result['json_lines']
-                        output_stem = os.path.splitext(os.path.basename(inputpath))[0]
-                        if page_tables:
-                            TABLE_STRUCTURE_FEATURE.write_html_files(
-                                imgname, page_tables, outputpath, output_stem,
-                            )
-                        page_markdown = build_gui_result_markdown(page_result, page_tables)
-                        outputplaintextlist.append(page_result['text'])
-                        outputtxtlist.append(page_markdown)
+                            idx, inputpath, img, det_pre = prefetched
+                            set_progress_message(inputpath)
+                            now_ui = time.monotonic()
+                            if idx == 0 or (now_ui - last_img_ui_update) >= 0.1:
+                                progressmessage.update()
+                                last_img_ui_update = now_ui
 
-                        alljsonobj = {
-                            'contents': [resjsonarray],
-                            'imginfo': {
-                                'img_width': img_w,
-                                'img_height': img_h,
-                                'img_path': inputpath,
-                                'img_name': os.path.basename(inputpath),
-                            },
-                            'xml': allxmlstr,
-                        }
-                        alljsonobjlist.append(alljsonobj)
-                        tei_jsonobjlist.append(alljsonobj)
+                            start = time.time()
+                            img_h, img_w = img.shape[:2]
+                            imgname = os.path.basename(inputpath)
 
-                        if chkbx_xml.value:
-                            with open(os.path.join(outputpath, output_stem + '.xml'), 'w', encoding='utf-8') as wf:
-                                wf.write(allxmlstr)
-
-                        if chkbx_visualize.value:
-                            output_vizpath = os.path.join(outputpath, 'viz_' + os.path.basename(inputpath))
-                            if output_vizpath.split('.')[-1] == 'jp2':
-                                output_vizpath = output_vizpath[:-4] + '.jpg'
-                            visualizepathlist.append(output_vizpath)
-                            await asyncio.to_thread(
-                                origin_detector.drawxml_detections,
-                                npimg=img,
-                                xmlstr=allxmlstr,
-                                categories=categories_org_name_index,
-                                outputimgpath=output_vizpath,
+                            page_result = await asyncio.to_thread(
+                                ocr._run_ocr_on_image_array,
+                                detector=origin_detector,
+                                recognizer30=origin_recognizer30,
+                                recognizer50=origin_recognizer50,
+                                recognizer100=origin_recognizer,
+                                inputname=imgname,
+                                img=img,
+                                outputpath=outputpath,
+                                save_viz=False,
+                                text_transform=text_transform,
+                                preprocessed_det=det_pre,
+                                include_markdown=False,
                             )
 
-                        if chkbx_json.value:
-                            with open(os.path.join(outputpath, output_stem + '.json'), 'w', encoding='utf-8') as wf:
-                                wf.write(json.dumps(alljsonobj, ensure_ascii=False, indent=2))
+                            page_tables = []
+                            if table_enabled:
+                                page_result, page_tables = await asyncio.to_thread(
+                                    TABLE_STRUCTURE_FEATURE.infer,
+                                    img,
+                                    page_result,
+                                    origin_table_recognizer,
+                                    args.table_crop_padding,
+                                )
 
-                        if chkbx_txt.value:
-                            with open(os.path.join(outputpath, output_stem + '.txt'), 'w', encoding='utf-8') as wtf:
-                                wtf.write('\n'.join(alltextlist))
+                            allxmlstr = '<OCRDATASET>\n' + page_result['page_xml'] + '\n</OCRDATASET>'
+                            alltextlist = [page_result['text']]
+                            resjsonarray = page_result['json_lines']
+                            output_stem = os.path.splitext(os.path.basename(inputpath))[0]
+                            if page_tables:
+                                await asyncio.to_thread(
+                                    TABLE_STRUCTURE_FEATURE.write_html_files,
+                                    imgname,
+                                    page_tables,
+                                    outputpath,
+                                    output_stem,
+                                )
+                            page_markdown = build_gui_result_markdown(page_result, page_tables)
+                            output_markdown = (
+                                build_output_result_markdown(page_result, page_tables)
+                                if (write_markdown and page_tables)
+                                else (page_markdown if write_markdown else '')
+                            )
+                            outputplaintextlist.append(page_result['text'])
+                            outputtxtlist.append(page_markdown)
 
-                        if chkbx_markdown.value:
-                            with open(os.path.join(outputpath, output_stem + '.md'), 'w', encoding='utf-8') as wf:
-                                wf.write(build_output_result_markdown(page_result, page_tables))
-                        if chkbx_html.value:
-                            Path(outputpath, output_stem + '.html').write_text(
-                                build_output_result_html(imgname, [(page_result, page_tables)]),
-                                encoding='utf-8',
+                            alljsonobj = {
+                                'contents': [resjsonarray],
+                                'imginfo': {
+                                    'img_width': img_w,
+                                    'img_height': img_h,
+                                    'img_path': inputpath,
+                                    'img_name': os.path.basename(inputpath),
+                                },
+                                'xml': allxmlstr,
+                            }
+                            alljsonobjlist.append(alljsonobj)
+                            tei_jsonobjlist.append(alljsonobj)
+
+                            await img_writer.submit(
+                                _write_image_page_task,
+                                inputpath=inputpath,
+                                imgname=imgname,
+                                outputpath=outputpath,
+                                output_stem=output_stem,
+                                img=img,
+                                allxmlstr=allxmlstr,
+                                alltextlist=alltextlist,
+                                resjsonarray=resjsonarray,
+                                alljsonobj=alljsonobj,
+                                page_result=page_result,
+                                page_tables=page_tables,
+                                output_markdown=output_markdown,
+                                write_xml=write_xml,
+                                write_viz=write_viz,
+                                write_json=write_json,
+                                write_txt=write_txt,
+                                write_markdown=write_markdown,
+                                write_html=write_html,
+                                write_pdf=write_pdf,
+                                pdf_viztxt=pdf_viztxt,
+                                pdf_resolution=pdf_resolution,
+                                detector=origin_detector,
+                                categories_mapping=categories_org_name_index,
+                                build_html_fn=build_output_result_html,
+                                create_pdf_fn=create_pdf_func,
+                                on_complete=_on_image_page_written,
                             )
 
-                        if chkbx_pdf.value:
-                            pdf_outpath = os.path.join(outputpath, output_stem + '.pdf')
-                            await asyncio.to_thread(
-                                create_pdf_func,
-                                pdf_outpath,
-                                img,
-                                resjsonarray,
-                                chkbx_pdf_viztxt.value,
-                                resolution=int(parse_pdf_dpi(pdf_resolution_textfield.value)),
-                            )
-                            pdf_outpath_list.append(pdf_outpath)
+                            print('Total calculation time (Detection + Recognition):', time.time() - start)
+                            completed_count += 1
+                            progressbar.value += 1 / max(allsum, 1)
+                            preview_prev_btn.disabled = False
+                            preview_next_btn.disabled = False
+                            if outputtxtlist:
+                                preview_plain_text.value = outputplaintextlist[preview_index] if preview_index < len(outputplaintextlist) else ''
+                                preview_text.value = outputtxtlist[preview_index]
+                            if write_viz:
+                                img_writer.flush_completed()
+                            if len(visualizepathlist) > preview_index:
+                                preview_image.src = visualizepathlist[preview_index]
+                            elif inputpathlist:
+                                preview_image.src = inputpathlist[min(preview_index, len(inputpathlist) - 1)]
+                            if inputpathlist:
+                                current_visualizeimgname.value = os.path.basename(inputpathlist[min(preview_index, len(inputpathlist) - 1)])
+                                preview_name_semantics.value = current_visualizeimgname.value
+                            now_ui = time.monotonic()
+                            if (
+                                idx == 0
+                                or idx == len(standalone_inputpathlist) - 1
+                                or (now_ui - last_img_ui_update) >= 0.1
+                            ):
+                                preview_image.update()
+                                page.update()
+                                last_img_ui_update = now_ui
+                    except BaseException:
+                        img_loop_failed = True
+                        raise
+                    finally:
+                        img_prefetcher.close()
+                        await img_writer.close(suppress_errors=(cancelled or img_loop_failed))
 
-                        print('Total calculation time (Detection + Recognition):', time.time() - start)
-                        completed_count+=1
-                        progressbar.value += 1 / max(allsum, 1)
-                        preview_prev_btn.disabled = False
-                        preview_next_btn.disabled = False
-                        if outputtxtlist:
-                            preview_plain_text.value = outputplaintextlist[preview_index] if preview_index < len(outputplaintextlist) else ''
-                            preview_text.value = outputtxtlist[preview_index]
-                        if len(visualizepathlist) > 0:
-                            preview_image.src = visualizepathlist[min(preview_index, len(visualizepathlist) - 1)]
-                        elif inputpathlist:
-                            preview_image.src = inputpathlist[min(preview_index, len(inputpathlist) - 1)]
-                        if inputpathlist:
-                            current_visualizeimgname.value = os.path.basename(inputpathlist[min(preview_index, len(inputpathlist) - 1)])
-                            preview_name_semantics.value = current_visualizeimgname.value
-                        preview_image.update()
-                        page.update()
-                        if cancelled:
-                            break
+                batch_elapsed = max(time.time() - allstart, 1e-6)
+                LOGGER.info(
+                    'OCR batch finished | completed=%d/%d | cancelled=%s | elapsed=%.2fs (%.2f items/s)',
+                    completed_count,
+                    allsum,
+                    cancelled,
+                    batch_elapsed,
+                    completed_count / batch_elapsed,
+                )
                 if cancelled:
                     set_progress_message(
                         TRANSLATIONS["main_ocr_cancelled"][config_obj["langcode"]].format(
@@ -3005,8 +3325,6 @@ def main(page: ft.Page, args=None, download_models=False):
             chkbx_pdf_viztxt.update()
             chkbx_pdf_merge.disabled = not chkbx_pdf.value
             chkbx_pdf_merge.update()
-            pdf_resolution_textfield.disabled = not chkbx_pdf.value
-            pdf_resolution_textfield.update()
             pdf_options_panel.opacity = 1.0 if chkbx_pdf.value else 0.55
             pdf_options_panel.update()
 
@@ -3096,7 +3414,16 @@ def main(page: ft.Page, args=None, download_models=False):
             if progress_message_semantics is not None:
                 progress_message_semantics.label = message
 
-        chkbx_visualize = ft.Checkbox(label=TRANSLATIONS['main_visualize_label'][config_obj['langcode']], value=True, key='visualize')
+        def change_visualizestatus(e):
+            config_obj['visualize'] = bool(chkbx_visualize.value)
+            save_config()
+
+        chkbx_visualize = ft.Checkbox(
+            label=TRANSLATIONS['main_visualize_label'][config_obj['langcode']],
+            value=bool(config_obj.get('visualize', True)),
+            on_change=change_visualizestatus,
+            key='visualize',
+        )
         chkbx_json = ft.Checkbox(label='JSON', value=config_obj['json'], key='output_json')
         chkbx_txt = ft.Checkbox(label='TXT', value=config_obj['txt'], key='output_txt')
         chkbx_markdown = ft.Checkbox(label='Markdown（.md）', value=config_obj.get('markdown', False), key='output_markdown')
@@ -3108,13 +3435,12 @@ def main(page: ft.Page, args=None, download_models=False):
         chkbx_pdf_merge = ft.Checkbox(label='出力ファイルを1つのpdfにまとめる', value=config_obj['pdf_merge'], disabled=not chkbx_pdf.value, key='output_pdf_merge')
         chkbx_pdf_page_output = ft.Checkbox(label='複数ページPDFを入力とする時はTXT/JSON/XML/TEI/HTMLをページ毎に出力する', value=config_obj.get('pdf_page_output', True), key='output_pdf_page_output')
         pdf_resolution_textfield = ft.TextField(
-            label='PDFの出力解像度',
+            label=TRANSLATIONS['customize_pdf_resolution_label'][config_obj['langcode']],
             value=str(config_obj['pdf_resolution']),
             suffix='dpi',
             keyboard_type=ft.KeyboardType.NUMBER,
             width=210,
             dense=True,
-            disabled=not chkbx_pdf.value,
             key='output_pdf_resolution',
         )
         chkbx_text_daisy = ft.Checkbox(
@@ -3817,6 +4143,7 @@ def main(page: ft.Page, args=None, download_models=False):
                 outputpath=PDFTMPPATH,
                 save_viz=False,
                 text_transform=get_character_inclusion_transform(config_obj),
+                include_markdown=False,
             )
             return {
                 'text': page_result['text'],

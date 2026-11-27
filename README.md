@@ -46,8 +46,8 @@ v2.0.0 標準の PDF 入出力・縦中横 (`--enable-tcy`)・表構造認識 (`
 | **推論デバイス (`--device`)** | `cpu`（既定）または `cuda` の 2 択 | `auto`（既定）で `cuda > migraphx > rocm > openvino > webgpu > dml > cpu` を自動選択。失敗時は `cpu` へフォールバック（`--strict-device` / `--check-device` 対応） |
 | **AMD Radeon / Intel Arc** | 非対応 | ONNX Runtime `1.31.1` + Plugin EP（`webgpu` / `openvino`）および Linux ROCm（`migraphx` / `rocm`）に対応。**TableCenterNet (`DeformConv`)** も汎用 GPU 上で動作 |
 | **PARSeq 文字認識** | 静的 `batch=1` の逐次推論 | 実行時に ONNX グラフを動的バッチ軸へパッチし、`--batch-size`（既定 CUDA `64` / MIGraphX・ROCm `32` / 汎用 GPU `16`）でバッチ推論。`enable_mem_reuse=False`・sidecar キャッシュ・並列セッション初期化＋warm-up により初期化・推論遅延を解消 |
-| **複数画像 / PDF 処理** | ページ単位の逐次実行 | `[前処理プリフェッチ (CPU)] → [検出 + 3段認識 + 表解析 (GPU)] → [XML/JSON/TXT/PDF 書出し (CPU)]` の **3 段パイプライン並列化** |
-| **デスクトップ GUI** | デバイス固定 | 出力設定に「実行環境・GPU高速化」（デバイス・バッチサイズ・推論精度・環境診断）を追加。画面上部に稼働バックエンドとフォールバック警告バナーを表示し、`ndlocr-lite.log` へ診断ログを記録 |
+| **複数画像 / PDF 処理** | ページ単位の逐次実行 | `[前処理プリフェッチ / PDF 1回オープン (CPU)] → [検出 + 3段認識 + 表解析 (GPU)] → [XML/JSON/TXT/可視化PNG並列/PDF 非同期書出し (CPU)]` の **3 段パイプライン並列化**（CLI・GUI 共通） |
+| **デスクトップ GUI** | デバイス固定 | 出力設定に「実行環境・GPU高速化」（デバイス・バッチサイズ・推論精度・環境診断）と常時編集可能な PDF 入出力解像度設定を追加。可視化画像保存のチェック状態を保持し、画面上部に稼働バックエンドとフォールバック警告バナーを表示し、`ndlocr-lite.log` へ診断ログを記録 |
 | **認識精度と出力互換** | FP32 逐次基準 | **FP32 既定精度を維持**（5 画像・3p PDF 等で CPU `batch=1` と差分 0。複数ページ PDF も認識文字列・座標・読み順が一致し、`TEXTBLOCK CONF` のみ EP 間で 0.001 差が出うる）。オプションの `--precision fp16` で PARSeq 混合精度 FP16（高速・省 VRAM だが近似精度モードのため、特に長行 `rec100` や `--enable-tcy` で文字差が出うる）を選択可能 |
 | **ビルド / CI** | 標準配布構成 | `ci.yml`（Win/Linux × Python 3.11/3.12 自動テスト）＋ `build-flet-cross.yml`（Win/Linux の `cuda`・`gpu-generic` 4 ターゲットビルド＋成果物検証） |
 

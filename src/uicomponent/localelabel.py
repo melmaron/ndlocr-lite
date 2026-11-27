@@ -199,6 +199,10 @@ TRANSLATIONS = {
         "ja":"PDF生成オプション",
         "en":"PDF generation options"
     },
+    "customize_pdf_resolution_label":{
+        "ja":"PDFの入出力解像度",
+        "en":"PDF render / output DPI"
+    },
     "customize_multipage_title":{
         "ja":"複数ページPDFの入力",
         "en":"Multi-page PDF input"
