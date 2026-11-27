@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Build version string (e.g. 2.0.1)"
+        description: "Build version string (e.g. 2.0.2)"
         required: true
-        default: "2.0.1"
+        default: "2.0.2"
         type: string
       create_release:
         description: "Create/publish a GitHub Release (disable for test builds)"
@@ -37,7 +37,7 @@ jobs:
               --draft \
               --title "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --notes "GUI デスクトップアプリケーションのビルド済みパッケージ（NDLOCR-Lite GPU fork / ${RELEASE_TAG}）。Windows / Linux の 4 ターゲット構成です（macOS 版は非提供）。cuda 版は CUDA 13 ランタイム + cuDNN 9 が別途必要（非同梱）、gpu_generic 版は D3D12（Windows）/ Vulkan libvulkan.so.1（Linux）が必要です（Linux 版は GTK3 / glibc 2.35+ 必要）。展開先は日本語（全角文字）を含まないパスにしてください。"
+              --notes "GUI デスクトップアプリケーションのビルド済みパッケージ（NDLOCR-Lite GPU fork / ${RELEASE_TAG}）。Windows / Linux の 4 ターゲット構成です（macOS 版は非提供）。cuda 版（windows_cuda.zip / linux_cuda.tar.gz）は CUDA 13 + cuDNN 9 ランタイムを同梱済みのため CUDA Toolkit の別途導入は不要です（CUDA 13 対応 NVIDIA ドライバ R580 以降が必要・容量約 1.2〜1.6 GB）。gpu_generic 版は WebGPU / OpenVINO / TBB ランタイムを同梱済みです（Windows は DirectX 12 ドライバ、Linux は Vulkan libvulkan.so.1 + GPU ドライバ + GTK3 / glibc 2.35+ が必要）。Windows 版は Visual C++ ランタイム DLL も同梱します。展開先は日本語（全角文字）を含まないパスにしてください。"
           fi
 
   cross-build:
@@ -70,6 +70,7 @@ jobs:
       BUILD_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PIP_NO_CACHE_DIR: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -97,7 +98,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir flet==1.1.2
 
       - name: "Install GStreamer libraries"
         if: runner.os == 'Linux'
@@ -124,6 +125,52 @@ jobs:
           flet build ${{ matrix.target-platform }} --output ..\${{ matrix.target-platform }} --build-version "%BUILD_VERSION%" --python-version 3.12
           copy main.py ..\${{ matrix.target-platform }}
 
+      - name: "Bundle Visual C++ CRT redistributables (Windows)"
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, os, shutil
+          from pathlib import Path
+
+          out_dir = Path("${{ matrix.target-platform }}")
+          crt_dlls = [
+              "msvcp140.dll",
+              "msvcp140_1.dll",
+              "msvcp140_2.dll",
+              "msvcp140_atomic_wait.dll",
+              "vcruntime140.dll",
+              "vcruntime140_1.dll",
+              "concrt140.dll",
+          ]
+          search_dirs = []
+          for root_pat in (
+              r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT",
+              r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT",
+          ):
+              matches = sorted((Path(p) for p in glob.glob(root_pat)), reverse=True)
+              search_dirs.extend(m for m in matches if m.is_dir())
+          sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+          if sys32.is_dir():
+              search_dirs.append(sys32)
+
+          for dll in crt_dlls:
+              dest = out_dir / dll
+              if dest.is_file():
+                  print(f"[CRT] already present: {dll}")
+                  continue
+              copied = False
+              for src_dir in search_dirs:
+                  cand = src_dir / dll
+                  if cand.is_file():
+                      shutil.copy2(cand, dest)
+                      print(f"[CRT] bundled {dll} from {cand}")
+                      copied = True
+                      break
+              if not copied:
+                  print(f"[CRT] optional/missing in search dirs: {dll}")
+          PY
+
       - name: "Verify build artifact contents"
         shell: bash
         run: |
@@ -133,13 +180,12 @@ jobs:
             --variant "${{ matrix.variant }}" \
             --python-version 3.12
 
-      - name: "Linux/MacOS compress"
-        if: runner.os != 'Windows'
-        run: tar zcvf "${BINARY_NAME}" ${{ matrix.target-platform }}
-
-      - name: "Windows compress"
-        if: runner.os == 'Windows'
-        run: powershell Compress-Archive -Path ${{ matrix.target-platform }} -DestinationPath "${env:BINARY_NAME}"
+      - name: "Package build artifact"
+        shell: bash
+        run: |
+          python scripts/package_flet_artifact.py \
+            --source-dir "${{ matrix.target-platform }}" \
+            --output "${BINARY_NAME}"
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4

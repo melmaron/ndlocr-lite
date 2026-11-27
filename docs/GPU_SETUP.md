@@ -28,18 +28,19 @@
 
 ### 2.0 配布パッケージ（GUI バイナリ）の前提条件とトラブルシューティング
 
-GitHub Releases で配布しているビルド済み GUI パッケージ（Windows / Linux の各 `cuda`・`gpu_generic` 4 ターゲット）では、以下のランタイムが外部依存となります。
+GitHub Releases で配布しているビルド済み GUI パッケージ（Windows / Linux の各 `cuda`・`gpu_generic` 4 ターゲット）では、再配布可能なランタイムはパッケージに同梱済みであり、OS 側の GPU ドライバ・デスクトップ基盤のみが外部前提となります。
 
-| ターゲット | 同梱 EP | 別途必要な環境（非同梱） | 補足 |
+| ターゲット | 同梱 EP・ランタイム | 別途必要な OS 環境（ドライバ等） | 補足 |
 |---|---|---|---|
-| `windows_cuda.zip` | CUDA (`ORT 1.31.1`) | **CUDA 13 ランタイム (`cudart64_13.dll`, `cublas64_13.dll` 等) + cuDNN 9 (`cudnn64_9.dll`)** | 非同梱。CUDA 12 のみの環境では起動時 preflight が不足 DLL を検出し、警告バナー付きで CPU へフォールバックします |
-| `linux_cuda.tar.gz` | CUDA (`ORT 1.31.1`) | **CUDA 13 ランタイム (`libcudart.so.13`, `libcublas.so.13` 等) + cuDNN 9 (`libcudnn.so.9`)** + GTK3 (`libgtk-3-0`) + glibc 2.35+ | Ubuntu 22.04 以降目安 |
-| `windows_gpu_generic.zip` | WebGPU / OpenVINO | DirectX 12 対応 GPU ドライバ | NVIDIA GPU では WebGPU の `CompileShaderDXC E_INVALIDARG` で CPU に落ちる場合があるため、`cuda` 版の代替にはなりません |
-| `linux_gpu_generic.tar.gz` | WebGPU / OpenVINO | Vulkan (`libvulkan.so.1`) + GPU ドライバ + GTK3 + glibc 2.35+ | `onnxruntime-ep-openvino` は **x86_64 のみ**対応（ARM64 Linux は WebGPU のみ） |
+| `windows_cuda.zip` | CUDA EP (`ORT 1.31.1`) + **CUDA 13 + cuDNN 9 + VC++ ランタイム DLL 一式** | CUDA 13 対応 NVIDIA 公式ドライバ（**R580 以降**） | **CUDA Toolkit の別途導入は不要**（容量目安 ~1.25 GB）。R580 未満または NVIDIA GPU 非搭載時は警告バナー付きで CPU へフォールバックします |
+| `linux_cuda.tar.gz` | CUDA EP (`ORT 1.31.1`) + **CUDA 13 + cuDNN 9 (`libcurand` 含む)** | CUDA 13 対応 NVIDIA 公式ドライバ（**R580 以降**） + GTK3 (`libgtk-3-0`) + glibc 2.35+ | Ubuntu 22.04 以降目安（容量目安 ~1.55 GB） |
+| `windows_gpu_generic.zip` | WebGPU / OpenVINO + DXC / D3D12 Agility / TBB + **VC++ ランタイム DLL 一式** | DirectX 12 対応 GPU ドライバ | NVIDIA GPU では WebGPU の `CompileShaderDXC E_INVALIDARG` で CPU に落ちる場合があるため、`cuda` 版を推奨 |
+| `linux_gpu_generic.tar.gz` | WebGPU / OpenVINO + TBB ランタイム | Vulkan (`libvulkan.so.1`) + GPU ドライバ + GTK3 + glibc 2.35+ | `onnxruntime-ep-openvino` は **x86_64 のみ**対応（ARM64 Linux は WebGPU のみ） |
 
-- **配布 `cuda` 版で GPU が使えない場合（CUDA 12 のみ・未導入環境）**:
-  - 配布パッケージには Python / `pip` が同梱されないため、システムに **NVIDIA CUDA Toolkit 13.x** および **cuDNN 9.x** をインストールし、Windows では両者の `bin` フォルダが環境変数 `PATH` に（Linux では `lib` フォルダが `LD_LIBRARY_PATH` 等に）含まれている状態でアプリを再起動してください。
-  - GUI 起動時に不足 DLL 名（例: `cudart64_13.dll`, `cudnn64_9.dll`）とシステム上の CUDA 12 検出有無が警告バナーおよび「環境診断」ダイアログへ自動表示され、`ndlocr-lite.log` にも記録されます。
+- **配布版で GPU が使えず CPU へフォールバックした場合**:
+  - `cuda` 版で「ドライバ未検出 / 古いドライバ」と表示された場合は、NVIDIA 公式ドライバ（R580 以降）をインストール／更新して再起動してください（CUDA Toolkit / `PATH` 設定は不要です）。AMD Radeon / Intel Arc 搭載 PC の場合は `gpu_generic` 版をダウンロードしてください。
+  - Windows 環境では WebGPU / OpenVINO / CUDA の読み込みに必要な VC++ ランタイム DLL（`msvcp140_1.dll`, `msvcp140_atomic_wait.dll` 等）も同梱しています。ファイル欠損疑い時は日本語を含まないパスへ一式を再展開してください。
+  - GUI 起動時の診断結果と対処手順は画面上部の警告バナー・「環境診断」ダイアログ（ログフォルダを開くボタン付き）・`ndlocr-lite.log` で確認できます。
 - **AMD MIGraphX / ROCm・macOS について**:
   - AMD Radeon 向けの `migraphx` / `rocm` は配布バイナリには含まれず、Linux ROCm 環境でのソース導入限定です（配布パッケージの AMD GPU は `gpu_generic` の WebGPU を利用）。
   - macOS は実機検証が無く、CoreML EP 未対応（CPU 専用）かつ `onnxruntime==1.23.2` 固定で `TableCenterNet`（ORT >= 1.25 必須）も非対応のため、配布バイナリ対象外としています。
@@ -61,20 +62,17 @@ pip install -r requirements-gpu-generic.txt
 
 `onnxruntime-gpu==1.31.1` を導入します（CUDA Toolkit / cuDNN ランタイム環境に応じたインデックスを選択）。
 
-**CUDA 13 系環境（PyPI 既定）:**
+**CUDA 13 系環境（PyPI 既定・ランタイム同梱）:**
 ```bash
 pip uninstall -y onnxruntime
 pip install -r requirements-cuda.txt
 ```
-ホストにシステム CUDA 13 ランタイム / cuDNN 9 が未導入（Windows CUDA 12.8 のみや Colab 以外の素の venv 等）でも、以下の pip CUDA 13 ランタイム wheel を同じ仮想環境へ追加すれば、`ort_provider.py` が起動時に `ort.preload_dlls()` を自動呼び出しするため、`PATH` や `LD_LIBRARY_PATH` を手動変更せずに CUDA 13 が動作します。
-```bash
-pip install nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cusparse nvidia-cusolver nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cudnn-cu13
-```
+`requirements-cuda.txt` には `nvidia-cuda-runtime~=13.0`、`nvidia-cublas~=13.0`、`nvidia-cuda-nvrtc~=13.0`、`nvidia-cudnn-cu13~=9.0`（および Linux では `nvidia-curand~=10.0`）が含まれており、`ort_provider.py` が起動時に `os.add_dll_directory` と `ort.preload_dlls()` で自動読み込みするため、システムに CUDA 13 Toolkit を別途導入したり `PATH` / `LD_LIBRARY_PATH` を変更しなくても CUDA 13 が動作します（必要なのは CUDA 13 対応 NVIDIA 公式ドライバ R580 以降のみ）。
 
 **CUDA 12 系環境（Google Colab 等を含む、`onnxruntime-cuda-12` Azure インデックスは `onnxruntime-gpu==1.29.0` 安定版まで提供、ORT>=1.25 で TableCenterNet 対応）:**
 ```bash
 pip uninstall -y onnxruntime
-pip install -r requirements-cuda.txt
+pip install -r requirements.txt
 pip install --force-reinstall --no-deps \
   --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ \
   onnxruntime-gpu==1.29.0

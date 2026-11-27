@@ -78,10 +78,10 @@ _BACKEND_MONOLITHIC_PROVIDER: Dict[str, str] = {
 
 _INSTALL_HINTS: Dict[str, str] = {
     "cuda": (
-        "NVIDIA CUDA 13 ランタイム + cuDNN 9 が必要です（配布 GUI パッケージには非同梱）。"
-        "配布 GUI 版では CUDA Toolkit 13.x / cuDNN 9.x を導入し、bin/lib パス（Windows は PATH、Linux は LD_LIBRARY_PATH）を設定してください。"
-        "ソース実行時は `pip install \"onnxruntime-gpu[cuda,cudnn]==1.31.1\"`"
-        "（CUDA 12 系環境では Azure インデックスから `onnxruntime-gpu==1.29.0`）を導入してください。"
+        "CUDA 13 対応の NVIDIA GPU ドライバ（R580 以降）が必要です"
+        "（CUDA 13 + cuDNN 9 ランタイムは配布 `cuda` パッケージおよび `requirements-cuda.txt` に同梱されています）。"
+        "環境に応じて NVIDIA 公式ドライバを更新するか、ソース環境では `pip install -r requirements-cuda.txt`"
+        "（CUDA 12 系環境では `requirements.txt` 導入後に Azure インデックスから `onnxruntime-gpu==1.29.0`）を確認してください。"
     ),
     "migraphx": (
         "Linux AMD ROCm環境向けに `onnxruntime-migraphx` と AMDMIGraphX / ROCm "
@@ -92,12 +92,14 @@ _INSTALL_HINTS: Dict[str, str] = {
         "と ROCm ランタイムの導入が必要です（ソースビルド環境向け）。"
     ),
     "openvino": (
-        "Intel Arc / iGPU 環境向けに `pip install onnxruntime-ep-openvino` と"
-        "最新の Intel GPU ドライバ（Linux では OpenCL / Level Zero）を導入してください（x86_64 のみ）。"
+        "Intel Arc / Core Ultra GPU 環境では最新の Intel GPU ドライバ"
+        "（Linux では Intel Compute Runtime / OpenCL `libOpenCL.so.1`）が必要です"
+        "（配布 `gpu_generic` パッケージおよび `requirements-gpu-generic.txt` に OpenVINO / TBB ランタイムは同梱済み・x86_64 限定）。"
     ),
     "webgpu": (
-        "Radeon / Arc / NVIDIA 共通GPU向けに `pip install onnxruntime-ep-webgpu` を導入してください"
-        "（Linux では `libvulkan.so.1` と Vulkan ドライバ、Windows では DirectX 12 対応ドライバが必要です）。"
+        "Radeon / Arc / NVIDIA 共通GPUバックエンドには、Windows では DirectX 12 対応 GPU ドライバ、"
+        "Linux では Vulkan ローダ (`libvulkan.so.1`) と GPU Vulkan ドライバが必要です"
+        "（配布 `gpu_generic` パッケージおよび `requirements-gpu-generic.txt` に WebGPU / DXC ランタイムは同梱済み）。"
     ),
     "dml": (
         "Windows DirectML環境向けに `pip install onnxruntime-directml` を導入してください"
@@ -116,9 +118,11 @@ _BACKEND_PLUGIN_NAME: Dict[str, str] = {
     "openvino": "openvino_ep",
 }
 
-_PLUGIN_LOCK = threading.Lock()
+_PLUGIN_LOCK = threading.RLock()
 _REGISTERED_PLUGINS: Dict[str, str] = {}
 _PLUGIN_ERRORS: Dict[str, str] = {}
+_DLL_DIR_HANDLES: List[Any] = []
+_REGISTERED_DLL_DIRS: set[str] = set()
 _CUDA_DLLS_PRELOADED = False
 _CUDA_DLLS_ERROR: Optional[str] = None
 _CUDA_PRELOAD_OUTPUT: Optional[str] = None
@@ -140,6 +144,9 @@ class BackendProfile:
     fallback_occurred: bool = False
     warning_message: Optional[str] = None
     display_name: str = "CPU"
+    fallback_reason: Optional[str] = None
+    fallback_hint: Optional[str] = None
+    fallback_category: Optional[str] = None
 
 
 def parse_ort_version(version_str: Optional[str] = None) -> Tuple[int, int, int]:
@@ -205,6 +212,80 @@ def prepare_backend_for_parallel_init(device: Optional[str]) -> None:
     register_plugin_eps()
 
 
+def _register_dll_directory(directory: Path) -> None:
+    """Register a directory via os.add_dll_directory on Windows once, retaining its cookie."""
+    if sys.platform != "win32":
+        return
+    add_dll_dir = getattr(os, "add_dll_directory", None)
+    if not callable(add_dll_dir):
+        return
+    try:
+        resolved = Path(directory).resolve()
+        if not resolved.is_dir():
+            return
+    except OSError:
+        return
+    key = str(resolved).casefold()
+    with _PLUGIN_LOCK:
+        if key in _REGISTERED_DLL_DIRS:
+            return
+        try:
+            handle = add_dll_dir(str(resolved))
+            _REGISTERED_DLL_DIRS.add(key)
+            _DLL_DIR_HANDLES.append(handle)
+        except OSError:
+            pass
+
+
+def _nvidia_dll_dir_candidates(
+    cuda_major: str,
+    *,
+    plat: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> List[Path]:
+    """Return bundled site-packages NVIDIA and ORT capi directories for runtime loading."""
+    ort_file = getattr(ort, "__file__", None)
+    if not ort_file:
+        return []
+    ort_dir = Path(ort_file).resolve().parent
+    site_packages = ort_dir.parent
+    capi_dir = ort_dir / "capi"
+    active_plat = plat or sys.platform
+    active_machine = (machine or platform.machine()).lower()
+    arch = "arm64" if active_machine in ("arm64", "aarch64") else "x86_64"
+
+    if active_plat == "win32":
+        return [
+            site_packages / "nvidia" / f"cu{cuda_major}" / "bin" / arch,
+            site_packages / "nvidia" / "cuda_runtime" / "bin",
+            site_packages / "nvidia" / "cublas" / "bin",
+            site_packages / "nvidia" / "cuda_nvrtc" / "bin",
+            site_packages / "nvidia" / "curand" / "bin",
+            site_packages / "nvidia" / "cudnn" / "bin",
+            capi_dir,
+        ]
+    return [
+        site_packages / "nvidia" / f"cu{cuda_major}" / "lib",
+        site_packages / "nvidia" / "cuda_runtime" / "lib",
+        site_packages / "nvidia" / "cublas" / "lib",
+        site_packages / "nvidia" / "cuda_nvrtc" / "lib",
+        site_packages / "nvidia" / "curand" / "lib",
+        site_packages / "nvidia" / "cudnn" / "lib",
+        capi_dir,
+    ]
+
+
+def _register_bundled_nvidia_dll_dirs(cuda_major: Optional[str] = None) -> List[Path]:
+    """Ensure bundled NVIDIA bin directories are in the Windows DLL search path."""
+    major = cuda_major or _detect_expected_cuda_major()
+    registered: List[Path] = []
+    for candidate_dir in _nvidia_dll_dir_candidates(major):
+        if candidate_dir.is_dir():
+            _register_dll_directory(candidate_dir)
+            registered.append(candidate_dir)
+    return registered
+
+
 def preload_cuda_dlls_if_needed() -> None:
     """Best-effort DLL preloading for pip-installed CUDA/cuDNN wheels on Windows/Linux."""
     global _CUDA_DLLS_PRELOADED, _CUDA_DLLS_ERROR, _CUDA_PRELOAD_OUTPUT, _CUDA_PROBE_CACHE
@@ -213,6 +294,7 @@ def preload_cuda_dlls_if_needed() -> None:
             return
         _CUDA_DLLS_PRELOADED = True
         _CUDA_PROBE_CACHE = None
+        _register_bundled_nvidia_dll_dirs()
         preload_fn = getattr(ort, "preload_dlls", None)
         if not callable(preload_fn):
             return
@@ -289,28 +371,42 @@ def _candidate_nvidia_lib_paths(
     active_plat = plat or sys.platform
     active_machine = (machine or platform.machine()).lower()
     arch = "arm64" if active_machine in ("arm64", "aarch64") else "x86_64"
+    lower_name = filename.casefold()
 
     paths: List[Path] = []
     if active_plat == "win32":
-        if "cudnn" in filename.casefold():
+        if "cudnn" in lower_name:
             paths.append(site_packages / "nvidia" / "cudnn" / "bin" / filename)
         else:
             paths.extend([
                 site_packages / "nvidia" / f"cu{cuda_major}" / "bin" / arch / filename,
                 site_packages / "nvidia" / "cuda_runtime" / "bin" / filename,
                 site_packages / "nvidia" / "cublas" / "bin" / filename,
+                site_packages / "nvidia" / "cuda_nvrtc" / "bin" / filename,
+                site_packages / "nvidia" / "curand" / "bin" / filename,
             ])
     else:
-        if "cudnn" in filename.casefold():
+        if "cudnn" in lower_name:
             paths.append(site_packages / "nvidia" / "cudnn" / "lib" / filename)
         else:
             paths.extend([
                 site_packages / "nvidia" / f"cu{cuda_major}" / "lib" / filename,
                 site_packages / "nvidia" / "cuda_runtime" / "lib" / filename,
                 site_packages / "nvidia" / "cublas" / "lib" / filename,
+                site_packages / "nvidia" / "cuda_nvrtc" / "lib" / filename,
+                site_packages / "nvidia" / "curand" / "lib" / filename,
             ])
     paths.append(capi_dir / filename)
     return paths
+
+
+def _detect_bundled_cuda_runtime(cuda_major: str) -> bool:
+    """Return True if bundled NVIDIA CUDA and cuDNN wheel files exist in site-packages."""
+    cudart = f"cudart64_{cuda_major}.dll" if sys.platform == "win32" else f"libcudart.so.{cuda_major}"
+    cudnn = "cudnn64_9.dll" if sys.platform == "win32" else "libcudnn.so.9"
+    has_cudart = any(p.is_file() for p in _candidate_nvidia_lib_paths(cuda_major, cudart)[:-1])
+    has_cudnn = any(p.is_file() for p in _candidate_nvidia_lib_paths(cuda_major, cudnn)[:-1])
+    return has_cudart and has_cudnn
 
 
 def _can_load_shared_lib(
@@ -343,34 +439,60 @@ def build_cuda_runtime_hint(probe: Dict[str, Any]) -> str:
     """Build actionable troubleshooting guidance for CUDA runtime preflight results."""
     major = str(probe.get("expected_cuda_major") or "13")
     other = probe.get("detected_other_cuda_major")
+    issue_code = probe.get("issue_code")
+    driver_lib = probe.get("driver_lib") or ("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
+    bundled = bool(probe.get("bundled_runtime_present"))
+
+    if issue_code == "cuda_driver_missing":
+        return (
+            f"NVIDIA GPU ドライバ ({driver_lib}) が見つかりません。"
+            f"NVIDIA GPU をお使いの場合は CUDA {major} 対応の公式 NVIDIA ドライバ（R580 以降）をインストールしてください"
+            "（配布 `cuda` 版には CUDA/cuDNN ランタイムが同梱されているため Toolkit の別途導入は不要です）。"
+            "AMD Radeon / Intel Arc をお使いの場合は `gpu_generic` 版パッケージをご利用ください。"
+        )
+
     parts: List[str] = []
     if other:
         parts.append(
-            f"この環境では CUDA {other} のみが検出されましたが、"
+            f"この環境ではシステム上に CUDA {other} のみが検出されましたが、"
             f"導入済みビルド (onnxruntime {getattr(ort, '__version__', '?')}) は CUDA {major} + cuDNN 9 向けです。"
         )
-    parts.append(
-        f"【配布 GUI 版】NVIDIA CUDA Toolkit {major}.x と cuDNN 9.x をインストールし、"
-        + (
-            "それぞれの bin フォルダを環境変数 PATH に追加して再起動してください（CUDA 13 ランタイムはパッケージに非同梱です）。"
-            if sys.platform == "win32"
-            else "ライブラリパス（LD_LIBRARY_PATH 等）が通っている状態で再起動してください（CUDA 13 ランタイムはパッケージに非同梱です）。"
-        )
-    )
-    if major == "13":
+    if issue_code == "cuda_provider_unregistered":
         parts.append(
-            "【ソース実行】仮想環境へ `pip install \"onnxruntime-gpu[cuda,cudnn]==1.31.1\"`"
-            "（または CUDA 12 環境向けに `onnxruntime-gpu==1.29.0` from onnxruntime-cuda-12 インデックス）を導入してください。"
+            f"CUDAExecutionProvider の初期化に失敗しました。NVIDIA 公式ドライバが CUDA {major}（R580 以降）に対応しているか確認し、"
+            "Windows の場合は配布 zip を欠けなく展開し直してください。"
+        )
+    elif bundled:
+        parts.append(
+            f"同梱されている CUDA {major} / cuDNN 9 ライブラリの読み込みに失敗しました。"
+            "日本語（全角文字）を含まないフォルダへ配布アーカイブ一式を再展開し、"
+            + ("Visual C++ 再頒布可能パッケージおよび最新の NVIDIA ドライバ（R580 以降）" if sys.platform == "win32" else "最新の NVIDIA ドライバ（R580 以降）およびシステム `zlib`")
+            + "を確認してください。"
         )
     else:
         parts.append(
-            f"【ソース実行】CUDA {major} / cuDNN 9 ランタイム（例: `nvidia-cudnn-cu12` 等）が導入されているか確認してください。"
+            f"【配布 GUI 版】`cuda` 版パッケージ（v2.0.2 以降）には CUDA {major} + cuDNN 9 ランタイムが同梱されています。"
+            "`site-packages/nvidia` 配下が欠けていないか確認し、アーカイブ一式を再展開してください"
+            + (
+                f"（手動導入する場合は CUDA Toolkit {major}.x + cuDNN 9.x をインストールして PATH を設定してください）。"
+                if sys.platform == "win32"
+                else f"（手動導入する場合は CUDA Toolkit {major}.x + cuDNN 9.x の LD_LIBRARY_PATH を設定してください）。"
+            )
         )
+        if major == "13":
+            parts.append(
+                "【ソース実行】仮想環境へ `pip install -r requirements-cuda.txt`"
+                "（または CUDA 12 環境向けに `requirements.txt` 導入後 `onnxruntime-gpu==1.29.0` from onnxruntime-cuda-12 インデックス）を導入してください。"
+            )
+        else:
+            parts.append(
+                f"【ソース実行】CUDA {major} / cuDNN 9 ランタイム（例: `nvidia-cudnn-cu12` 等）が導入されているか確認してください。"
+            )
     return " ".join(parts)
 
 
 def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
-    """Check whether CUDAExecutionProvider's required CUDA/cuDNN libraries actually load."""
+    """Check whether CUDAExecutionProvider's required CUDA/cuDNN and driver libraries load."""
     global _CUDA_PROBE_CACHE
     available_providers = set(ort.get_available_providers())
     provider_present = "CUDAExecutionProvider" in available_providers
@@ -397,6 +519,10 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
             "runtime_ready": False,
             "missing_libs": [],
             "lib_errors": {},
+            "driver_lib": "",
+            "driver_missing": False,
+            "bundled_runtime_present": False,
+            "issue_code": None,
             "detected_other_cuda_major": None,
             "preload_error": preload_error,
             "preload_output": preload_output,
@@ -415,13 +541,16 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
             f"cublas64_{major}.dll",
             "cudnn64_9.dll",
         ]
+        driver_lib = "nvcuda.dll"
     else:
         required_libs = [
             f"libcudart.so.{major}",
             f"libcublasLt.so.{major}",
             f"libcublas.so.{major}",
+            "libcurand.so.10",
             "libcudnn.so.9",
         ]
+        driver_lib = "libcuda.so.1"
 
     missing_libs: List[str] = []
     lib_errors: Dict[str, str] = {}
@@ -433,6 +562,13 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
             missing_libs.append(lib_name)
             if err:
                 lib_errors[lib_name] = err
+
+    driver_ok, driver_err = _can_load_shared_lib(driver_lib, [])
+    driver_missing = not driver_ok
+    if driver_missing and driver_err:
+        lib_errors[driver_lib] = driver_err
+
+    bundled_runtime_present = _detect_bundled_cuda_runtime(major)
 
     detected_other: Optional[str] = None
     cudart_name = required_libs[0]
@@ -449,10 +585,12 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
         if alt_ok:
             detected_other = alt_major
 
-    runtime_ready = provider_present and not missing_libs
+    runtime_ready = provider_present and not missing_libs and not driver_missing
+    issue_code: Optional[str] = None
     if runtime_ready:
         detail = f"CUDAExecutionProvider (CUDA {major} + cuDNN 9 verified)"
     elif missing_libs:
+        issue_code = "cuda_runtime_missing"
         mismatch = (
             f"（システムには CUDA {detected_other} のみ検出）"
             if detected_other
@@ -463,10 +601,15 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
             + ", ".join(missing_libs)
             + mismatch
         )
+    elif driver_missing:
+        issue_code = "cuda_driver_missing"
+        detail = f"NVIDIA GPU ドライバ ({driver_lib}) が見つかりません"
     else:
+        issue_code = "cuda_provider_unregistered"
         extra = f": {preload_error}" if preload_error else ""
+        provider_label = bundled_provider.name if bundled_provider is not None else "CUDA provider"
         detail = (
-            f"CUDA provider library exists ({bundled_provider.name}), "
+            f"CUDA provider library exists ({provider_label}), "
             f"but CUDAExecutionProvider is not registered{extra}"
         )
 
@@ -477,6 +620,10 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
         "runtime_ready": runtime_ready,
         "missing_libs": missing_libs,
         "lib_errors": lib_errors,
+        "driver_lib": driver_lib,
+        "driver_missing": driver_missing,
+        "bundled_runtime_present": bundled_runtime_present,
+        "issue_code": issue_code,
         "detected_other_cuda_major": detected_other,
         "preload_error": preload_error,
         "preload_output": preload_output,
@@ -487,6 +634,76 @@ def probe_cuda_runtime(*, refresh: bool = False) -> Dict[str, Any]:
     with _PLUGIN_LOCK:
         _CUDA_PROBE_CACHE = dict(result)
     return result
+
+
+def probe_webgpu_runtime(
+    ep_devices: Sequence[Any],
+    plugin_is_loaded: bool,
+) -> Optional[Dict[str, Any]]:
+    """Inspect WebGPU plugin load errors or missing host graphics runtimes."""
+    if "webgpu" in _PLUGIN_ERRORS:
+        return {
+            "declared": True,
+            "status": "missing_runtime",
+            "issue_code": "webgpu_plugin_error",
+            "detail": f"plugin error: {_PLUGIN_ERRORS['webgpu']}",
+            "hint": (
+                "WebGPU プラグインの読み込みに失敗しました。"
+                + (
+                    "配布パッケージ一式を日本語（全角文字）を含まないパスへ再展開し、Visual C++ ランタイムと DirectX 12 ドライバを確認してください。"
+                    if sys.platform == "win32"
+                    else "配布パッケージ一式を再展開し、標準 C++ ランタイムと Vulkan (`libvulkan.so.1`) を確認してください。"
+                )
+            ),
+        }
+    webgpu_all = _find_plugin_devices_for_backend(
+        "webgpu", ep_devices, include_virtual_webgpu=True
+    )
+    if plugin_is_loaded and not webgpu_all:
+        if sys.platform == "linux":
+            ok, err = _can_load_shared_lib("libvulkan.so.1", [])
+            if not ok:
+                return {
+                    "declared": True,
+                    "status": "missing_runtime",
+                    "issue_code": "webgpu_vulkan_missing",
+                    "detail": f"Vulkan ランタイム (libvulkan.so.1) が見つかりません ({err or 'not found'})",
+                    "hint": (
+                        "Linux で WebGPU を利用するには `libvulkan1` と GPU 用 Vulkan ドライバの導入が必要です"
+                        "（例: Ubuntu/Debian では `sudo apt install libvulkan1 mesa-vulkan-drivers`、NVIDIA 環境では公式ドライバ）。"
+                    ),
+                }
+        elif sys.platform == "win32":
+            ok, err = _can_load_shared_lib("d3d12.dll", [])
+            if not ok:
+                return {
+                    "declared": True,
+                    "status": "missing_runtime",
+                    "issue_code": "webgpu_d3d12_missing",
+                    "detail": f"DirectX 12 ランタイム (d3d12.dll) が見つかりません ({err or 'not found'})",
+                    "hint": "Windows 10 (1909 以降) / Windows 11 および DirectX 12 対応 GPU ドライバが必要です。",
+                }
+    return None
+
+
+def probe_openvino_runtime(
+    ep_devices: Sequence[Any],
+    plugin_is_loaded: bool,
+) -> Optional[Dict[str, Any]]:
+    """Inspect OpenVINO plugin load errors when OpenVINO GPU is unavailable."""
+    _ = (ep_devices, plugin_is_loaded)
+    if "openvino_ep" in _PLUGIN_ERRORS:
+        return {
+            "declared": True,
+            "status": "missing_runtime",
+            "issue_code": "openvino_plugin_error",
+            "detail": f"plugin error: {_PLUGIN_ERRORS['openvino_ep']}",
+            "hint": (
+                "OpenVINO プラグインの読み込みに失敗しました。配布パッケージ一式を再展開し、"
+                "Intel GPU 環境では最新の Intel GPU ドライバ（Linux では OpenCL `libOpenCL.so.1`）を導入してください。"
+            ),
+        }
+    return None
 
 
 def register_plugin_eps() -> Dict[str, str]:
@@ -507,6 +724,13 @@ def register_plugin_eps() -> Dict[str, str]:
             except Exception as exc:
                 _PLUGIN_ERRORS[reg_name] = f"import/path error: {exc}"
                 continue
+
+            try:
+                lib_dir = Path(lib_path).resolve().parent
+                _register_dll_directory(lib_dir)
+                _register_dll_directory(lib_dir / "D3D12")
+            except OSError:
+                pass
 
             try:
                 register_fn(reg_name, lib_path)
@@ -641,6 +865,9 @@ def detect_available_backends(*, refresh: bool = False) -> Dict[str, Dict[str, A
                         "devices": [mono_provider],
                         "detail": cuda_probe["detail"],
                         "missing_libs": [],
+                        "driver_missing": False,
+                        "bundled_runtime_present": cuda_probe.get("bundled_runtime_present", False),
+                        "issue_code": None,
                         "hint": "",
                     }
                 else:
@@ -653,6 +880,9 @@ def detect_available_backends(*, refresh: bool = False) -> Dict[str, Dict[str, A
                         "devices": [mono_provider],
                         "detail": cuda_probe["detail"],
                         "missing_libs": list(cuda_probe["missing_libs"]),
+                        "driver_missing": bool(cuda_probe.get("driver_missing", False)),
+                        "bundled_runtime_present": cuda_probe.get("bundled_runtime_present", False),
+                        "issue_code": cuda_probe.get("issue_code"),
                         "detected_other_cuda_major": cuda_probe.get("detected_other_cuda_major"),
                         "hint": cuda_probe["hint"],
                     }
@@ -666,6 +896,9 @@ def detect_available_backends(*, refresh: bool = False) -> Dict[str, Dict[str, A
                     "devices": [],
                     "detail": f"{mono_provider} not available",
                     "missing_libs": [],
+                    "driver_missing": False,
+                    "bundled_runtime_present": False,
+                    "issue_code": None,
                     "hint": "",
                 }
             continue
@@ -699,39 +932,53 @@ def detect_available_backends(*, refresh: bool = False) -> Dict[str, Dict[str, A
                 "detail": mono_provider,
             }
         else:
+            plugin_probe: Optional[Dict[str, Any]] = None
             extra_note = ""
             if backend == "openvino":
-                ov_all = [
-                    d for d in ep_devices
-                    if str(getattr(d, "ep_name", "")) == "OpenVINOExecutionProvider"
-                ]
-                if ov_all or plugin_is_loaded:
-                    extra_note = "OpenVINO plugin loaded, but no Intel GPU device detected (CPU/NPU only)"
-                elif "openvino_ep" in _PLUGIN_ERRORS:
-                    extra_note = f"plugin error: {_PLUGIN_ERRORS['openvino_ep']}"
+                plugin_probe = probe_openvino_runtime(ep_devices, plugin_is_loaded)
+                if plugin_probe is None:
+                    ov_all = [
+                        d for d in ep_devices
+                        if str(getattr(d, "ep_name", "")) == "OpenVINOExecutionProvider"
+                    ]
+                    if ov_all or plugin_is_loaded:
+                        extra_note = "OpenVINO plugin loaded, but no Intel GPU device detected (CPU/NPU only)"
             elif backend == "webgpu":
-                webgpu_all = _find_plugin_devices_for_backend(
-                    "webgpu", ep_devices, include_virtual_webgpu=True
-                )
-                if "webgpu" in _PLUGIN_ERRORS:
-                    extra_note = f"plugin error: {_PLUGIN_ERRORS['webgpu']}"
-                elif webgpu_all:
-                    extra_note = (
-                        "WebGPU plugin loaded, but only software/virtual adapter detected "
-                        "(skipped for auto; use --device webgpu to force)"
+                plugin_probe = probe_webgpu_runtime(ep_devices, plugin_is_loaded)
+                if plugin_probe is None:
+                    webgpu_all = _find_plugin_devices_for_backend(
+                        "webgpu", ep_devices, include_virtual_webgpu=True
                     )
-                elif plugin_is_loaded:
-                    extra_note = "WebGPU plugin loaded, but no compatible GPU adapter detected"
+                    if webgpu_all:
+                        extra_note = (
+                            "WebGPU plugin loaded, but only software/virtual adapter detected "
+                            "(skipped for auto; use --device webgpu to force)"
+                        )
+                    elif plugin_is_loaded:
+                        extra_note = "WebGPU plugin loaded, but no compatible GPU adapter detected"
 
-            results[backend] = {
-                "available": False,
-                "declared": bool(plugin_is_loaded),
-                "verified": False,
-                "status": "unavailable",
-                "mode": "none",
-                "devices": [],
-                "detail": extra_note or f"{mono_provider} not available",
-            }
+            if plugin_probe is not None:
+                results[backend] = {
+                    "available": False,
+                    "declared": True,
+                    "verified": False,
+                    "status": "missing_runtime",
+                    "mode": "plugin",
+                    "devices": [],
+                    "detail": plugin_probe["detail"],
+                    "issue_code": plugin_probe["issue_code"],
+                    "hint": plugin_probe["hint"],
+                }
+            else:
+                results[backend] = {
+                    "available": False,
+                    "declared": bool(plugin_is_loaded),
+                    "verified": False,
+                    "status": "unavailable",
+                    "mode": "none",
+                    "devices": [],
+                    "detail": extra_note or f"{mono_provider} not available",
+                }
 
     return results
 
@@ -757,6 +1004,9 @@ def _make_profile(
     *,
     fallback_occurred: bool = False,
     warning_message: Optional[str] = None,
+    fallback_reason: Optional[str] = None,
+    fallback_hint: Optional[str] = None,
+    fallback_category: Optional[str] = None,
 ) -> BackendProfile:
     is_cpu = active_backend == "cpu"
     return BackendProfile(
@@ -770,6 +1020,9 @@ def _make_profile(
         fallback_occurred=fallback_occurred,
         warning_message=warning_message,
         display_name=_BACKEND_DISPLAY_NAMES.get(active_backend, active_backend.upper()),
+        fallback_reason=fallback_reason,
+        fallback_hint=fallback_hint,
+        fallback_category=fallback_category,
     )
 
 
@@ -998,6 +1251,122 @@ def _format_fallback_warning(
     return "\n".join(lines)
 
 
+def classify_backend_failure(
+    backend: str,
+    error_text: str,
+    probe: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str, str]:
+    """Classify a backend initialization/preflight failure into (category, reason, hint)."""
+    norm_backend = normalize_device_name(backend)
+    err = str(error_text or "").strip()
+    err_cf = err.casefold()
+
+    if norm_backend == "cuda":
+        if any(
+            marker in err_cf
+            for marker in ("insufficient", "driver version", "cudaerrorinsufficientdriver")
+        ):
+            return (
+                "cuda_driver_old",
+                "NVIDIA ドライバが CUDA 13 に対応していません",
+                "NVIDIA 公式ドライバを最新版（R580 以降）へ更新して再起動してください（CUDA Toolkit の別途導入は不要です）。",
+            )
+        if any(
+            marker in err_cf
+            for marker in ("no cuda-capable device", "cudaerrornodevice")
+        ):
+            return (
+                "cuda_no_device",
+                "NVIDIA GPU が検出されませんでした",
+                "NVIDIA GPU 搭載 PC か確認してください。AMD Radeon / Intel Arc 等をお使いの場合は `gpu_generic` 版をご利用ください。",
+            )
+        if probe is not None:
+            issue_code = probe.get("issue_code")
+            if issue_code == "cuda_driver_missing" or probe.get("driver_missing") and not probe.get("missing_libs"):
+                return (
+                    "cuda_driver_missing",
+                    str(probe.get("detail") or err or "NVIDIA GPU ドライバが見つかりません"),
+                    str(probe.get("hint") or _INSTALL_HINTS["cuda"]),
+                )
+            if probe.get("missing_libs") or issue_code == "cuda_runtime_missing":
+                return (
+                    "cuda_runtime_missing",
+                    str(probe.get("detail") or err or "CUDA ランタイムが不足しています"),
+                    str(probe.get("hint") or _INSTALL_HINTS["cuda"]),
+                )
+            if issue_code == "cuda_provider_unregistered":
+                return (
+                    "cuda_runtime_missing",
+                    str(probe.get("detail") or err),
+                    str(probe.get("hint") or _INSTALL_HINTS["cuda"]),
+                )
+
+    if norm_backend == "webgpu":
+        if "compileshaderdxc" in err_cf or "e_invalidarg" in err_cf:
+            return (
+                "webgpu_dxc_error",
+                "WebGPU シェーダのコンパイルに失敗しました (DXC)",
+                "Windows + NVIDIA GPU 環境では `cuda` 版パッケージ（windows_cuda.zip）のご利用を推奨します。AMD / Intel GPU の場合は GPU ドライバを最新版に更新してください。",
+            )
+        if probe is not None and probe.get("issue_code"):
+            return (
+                str(probe["issue_code"]),
+                str(probe.get("detail") or err),
+                str(probe.get("hint") or _INSTALL_HINTS["webgpu"]),
+            )
+        if "libvulkan" in err_cf or "vulkan" in err_cf:
+            return (
+                "webgpu_vulkan_missing",
+                err or "Vulkan ランタイム (libvulkan.so.1) が見つかりません",
+                _INSTALL_HINTS["webgpu"],
+            )
+        if "d3d12" in err_cf:
+            return (
+                "webgpu_d3d12_missing",
+                err or "DirectX 12 ランタイム (d3d12.dll) が見つかりません",
+                _INSTALL_HINTS["webgpu"],
+            )
+        if "plugin error" in err_cf:
+            return (
+                "webgpu_plugin_error",
+                err,
+                _INSTALL_HINTS["webgpu"],
+            )
+
+    if norm_backend == "openvino":
+        if probe is not None and probe.get("issue_code"):
+            return (
+                str(probe["issue_code"]),
+                str(probe.get("detail") or err),
+                str(probe.get("hint") or _INSTALL_HINTS["openvino"]),
+            )
+        if "plugin error" in err_cf:
+            return (
+                "openvino_plugin_error",
+                err,
+                _INSTALL_HINTS["openvino"],
+            )
+
+    if norm_backend == "dml" and (
+        "corrupted bounding boxes" in err_cf or "deim" in err_cf
+    ):
+        return (
+            "dml_deim_unsupported",
+            "DirectML ではレイアウト検出 (DEIMv2) のみ CPU で実行します",
+            "仕様通りの安全動作です（文字認識 PARSeq は DirectML GPU で実行されます）。",
+        )
+
+    default_cat = f"{norm_backend}_init_failed" if norm_backend in DEVICE_CHOICES else "gpu_init_failed"
+    if not err:
+        reason = f"{norm_backend} initialization failed"
+    elif err_cf.startswith(f"{norm_backend}:"):
+        reason = err
+    else:
+        reason = f"{norm_backend}: {err}"
+    hint = str((probe or {}).get("hint") or _INSTALL_HINTS.get(norm_backend, ""))
+    return (default_cat, reason, hint)
+
+
 def create_inference_session(
     model_path: str | Path,
     *,
@@ -1025,15 +1394,19 @@ def create_inference_session(
         availability = detect_available_backends()
         failures: List[str] = []
         hints: List[str] = []
+        classified_failures: List[Tuple[str, str, str, str]] = []
         for candidate in AUTO_PRIORITY:
             if candidate == "cpu":
                 continue
             cand_info = availability.get(candidate, {})
             if cand_info.get("status") == "missing_runtime":
-                failures.append(f"{candidate}: {cand_info.get('detail', 'runtime missing')}")
-                hint = cand_info.get("hint") or _INSTALL_HINTS.get(candidate)
-                if hint and hint not in hints:
-                    hints.append(hint)
+                detail = str(cand_info.get("detail") or "runtime missing")
+                failures.append(f"{candidate}: {detail}")
+                cat, reason, hint = classify_backend_failure(candidate, detail, cand_info)
+                effective_hint = hint or str(cand_info.get("hint") or _INSTALL_HINTS.get(candidate, ""))
+                classified_failures.append((candidate, cat, reason, effective_hint))
+                if effective_hint and effective_hint not in hints:
+                    hints.append(effective_hint)
                 continue
             if not cand_info.get("available"):
                 continue
@@ -1055,9 +1428,12 @@ def create_inference_session(
                 )
             except Exception as exc:
                 failures.append(f"{candidate}: {exc}")
-                hint = _INSTALL_HINTS.get(candidate)
-                if hint and hint not in hints:
-                    hints.append(hint)
+                probe_info = probe_cuda_runtime() if candidate == "cuda" else None
+                cat, reason, hint = classify_backend_failure(candidate, str(exc), probe_info)
+                effective_hint = hint or _INSTALL_HINTS.get(candidate, "")
+                classified_failures.append((candidate, cat, reason, effective_hint))
+                if effective_hint and effective_hint not in hints:
+                    hints.append(effective_hint)
 
         if failures and strict_device:
             hint_suffix = f" | {' '.join(hints)}" if hints else ""
@@ -1076,6 +1452,9 @@ def create_inference_session(
             model_label=model_label,
         )
         warning_msg = None
+        primary_cat = None
+        primary_reason = None
+        primary_hint = None
         if failures:
             warning_lines = [
                 f"[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します ({model_label}): "
@@ -1085,6 +1464,21 @@ def create_inference_session(
                 warning_lines.append("       対処法: " + " / ".join(hints))
             warning_msg = "\n".join(warning_lines)
             _emit_warning_once(("auto", "cpu", ";".join(failures)), warning_msg)
+            if classified_failures:
+                chosen = next(
+                    (item for item in classified_failures if item[0] == "cuda"),
+                    None,
+                )
+                if chosen is None:
+                    chosen = next(
+                        (
+                            item
+                            for item in classified_failures
+                            if item[1].endswith(("_missing", "_error", "_old", "_no_device"))
+                        ),
+                        classified_failures[0],
+                    )
+                _, primary_cat, primary_reason, primary_hint = chosen
         return session, _make_profile(
             requested_device="auto",
             active_backend="cpu",
@@ -1092,6 +1486,9 @@ def create_inference_session(
             device_id=device_id,
             fallback_occurred=bool(failures),
             warning_message=warning_msg,
+            fallback_reason=primary_reason,
+            fallback_hint=primary_hint,
+            fallback_category=primary_cat,
         )
 
     if requested == "cpu":
@@ -1133,16 +1530,18 @@ def create_inference_session(
             device_id=device_id,
         )
     except Exception as exc:
+        probe_info = probe_cuda_runtime() if requested == "cuda" else None
         cuda_hint: Optional[str] = None
-        if requested == "cuda":
-            probe = probe_cuda_runtime()
-            if probe.get("hint"):
-                cuda_hint = str(probe["hint"])
+        if requested == "cuda" and probe_info and probe_info.get("hint"):
+            cuda_hint = str(probe_info["hint"])
+        cat, reason, classified_hint = classify_backend_failure(
+            requested, str(exc), probe_info
+        )
+        effective_hint = classified_hint or cuda_hint or _INSTALL_HINTS.get(requested, "")
         if strict_device:
-            hint = cuda_hint or _INSTALL_HINTS.get(requested, "")
             raise RuntimeError(
                 f"Requested device '{requested}' failed for {model_label}: {exc}"
-                + (f" | {hint}" if hint else "")
+                + (f" | {effective_hint}" if effective_hint else "")
             ) from exc
 
         session, active_providers = _create_session_for_backend(
@@ -1158,7 +1557,7 @@ def create_inference_session(
             "cpu",
             str(exc),
             model_label,
-            hint_override=cuda_hint,
+            hint_override=effective_hint,
         )
         _emit_warning_once((requested, "cpu", str(exc)), warning_msg)
         return session, _make_profile(
@@ -1168,6 +1567,9 @@ def create_inference_session(
             device_id=device_id,
             fallback_occurred=True,
             warning_message=warning_msg,
+            fallback_reason=reason,
+            fallback_hint=effective_hint,
+            fallback_category=cat,
         )
 
 
@@ -1208,7 +1610,9 @@ def format_device_diagnostics(*, refresh: bool = False) -> str:
         lines.append("CUDA runtime preflight:")
         lines.append(
             f"  Expected CUDA major: {probe.get('expected_cuda_major') or 'unknown'} | "
-            f"status={cuda_info.get('status')} | provider_present={probe.get('provider_present')}"
+            f"status={cuda_info.get('status')} | provider_present={probe.get('provider_present')} | "
+            f"driver_missing={probe.get('driver_missing')} ({probe.get('driver_lib') or 'n/a'}) | "
+            f"bundled_runtime={probe.get('bundled_runtime_present')}"
         )
         if probe.get("missing_libs"):
             lines.append(f"  Missing libraries  : {', '.join(probe['missing_libs'])}")
@@ -1219,6 +1623,11 @@ def format_device_diagnostics(*, refresh: bool = False) -> str:
             )
         if probe.get("hint"):
             lines.append(f"  Hint               : {probe['hint']}")
+    for plugin_backend in ("openvino", "webgpu"):
+        p_info = availability.get(plugin_backend, {})
+        if p_info.get("status") == "missing_runtime" and p_info.get("hint"):
+            lines.append(f"Plugin preflight ({plugin_backend}): {p_info.get('detail')}")
+            lines.append(f"  Hint               : {p_info['hint']}")
     if ep_devices:
         lines.append("Discovered EP devices:")
         for idx, dev in enumerate(ep_devices):

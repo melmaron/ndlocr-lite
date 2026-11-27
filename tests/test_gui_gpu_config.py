@@ -490,12 +490,205 @@ class GuiGpuConfigTest(unittest.TestCase):
         }
         ja_opts = {o.key: o.text for o in self.app.build_device_dropdown_options(avail, True)}
         en_opts = {o.key: o.text for o in self.app.build_device_dropdown_options(avail, False)}
-        self.assertIn("ランタイム不足", ja_opts["cuda"])
+        self.assertIn("ドライバ/環境不足", ja_opts["cuda"])
         self.assertIn("利用可能", ja_opts["openvino"])
         self.assertIn("未検出", ja_opts["webgpu"])
-        self.assertIn("missing runtime", en_opts["cuda"])
+        self.assertIn("missing driver/runtime", en_opts["cuda"])
         self.assertIn("ready", en_opts["openvino"])
         self.assertIn("unavailable", en_opts["webgpu"])
+
+    def test_collect_engine_warnings_deduplicates_5_models_with_same_root_cause(self):
+        legacy_det = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                warning_message="[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (DEIM): cuda: CUDA 13 missing",
+            )
+        )
+        legacy_r100 = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                warning_message="[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (PARSEQ(rec100.onnx)): cuda: CUDA 13 missing",
+            )
+        )
+        legacy_r30 = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                warning_message="[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (PARSEQ(rec30.onnx)): cuda: CUDA 13 missing",
+            )
+        )
+        legacy_r50 = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                warning_message="[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (PARSEQ(rec50.onnx)): cuda: CUDA 13 missing",
+            )
+        )
+        legacy_tbl = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                warning_message="[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (TableCenterNet): cuda: CUDA 13 missing",
+            )
+        )
+        summary = self.app.collect_engine_warnings(
+            legacy_det, legacy_r100, legacy_r30, legacy_r50, legacy_tbl
+        )
+        self.assertTrue(summary["fallback_occurred"])
+        self.assertEqual(len(summary["warnings"]), 1)
+        self.assertEqual(len(summary["grouped_warnings"]), 1)
+        self.assertEqual(
+            summary["grouped_warnings"][0]["models"],
+            ["DEIMv2", "PARSeq-100", "PARSeq-30", "PARSeq-50", "TableCenterNet"],
+        )
+
+        # Structured category/reason also groups across models
+        s_det = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                fallback_category="cuda_driver_missing",
+                fallback_reason="NVIDIA GPU ドライバ (nvcuda.dll) が見つかりません",
+                fallback_hint="NVIDIA 公式ドライバを導入してください",
+                warning_message="[WARN] msg DEIM",
+            )
+        )
+        s_rec = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                fallback_occurred=True,
+                fallback_category="cuda_driver_missing",
+                fallback_reason="NVIDIA GPU ドライバ (nvcuda.dll) が見つかりません",
+                fallback_hint="NVIDIA 公式ドライバを導入してください",
+                warning_message="[WARN] msg PARSeq",
+            )
+        )
+        s_summary = self.app.collect_engine_warnings(s_det, s_rec)
+        self.assertEqual(len(s_summary["grouped_warnings"]), 1)
+        self.assertEqual(s_summary["grouped_warnings"][0]["category"], "cuda_driver_missing")
+
+    def test_format_fallback_banner_summary_is_concise_without_duplicate_prefix(self):
+        info = {
+            "fallback_occurred": True,
+            "warnings": ["[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (DEIM): cuda: driver missing"],
+            "grouped_warnings": [
+                {
+                    "models": ["DEIMv2", "PARSeq-100"],
+                    "category": "cuda_driver_missing",
+                    "reason": "NVIDIA GPU ドライバ (nvcuda.dll) が見つかりません",
+                    "hint": "",
+                    "raw_warning": "",
+                }
+            ],
+            "table_warning": None,
+        }
+        ja = self.app.format_fallback_banner_summary(info, langcode="ja")
+        self.assertIn("OCR はそのまま利用できます", ja)
+        self.assertIn("NVIDIA GPU ドライバ (nvcuda.dll)", ja)
+        self.assertNotIn("(DEIM)", ja)
+
+        en = self.app.format_fallback_banner_summary(info, langcode="en")
+        self.assertIn("GPU unavailable", en)
+        self.assertIn("NVIDIA GPU driver", en)
+
+    def test_build_friendly_diagnostics_guidance_handles_all_categories_without_pip_noise(self):
+        categories = [
+            "cuda_driver_missing",
+            "cuda_driver_old",
+            "cuda_no_device",
+            "cuda_runtime_missing",
+            "webgpu_vulkan_missing",
+            "webgpu_d3d12_missing",
+            "webgpu_dxc_error",
+            "webgpu_plugin_error",
+            "openvino_plugin_error",
+            "dml_deim_unsupported",
+            "custom_unknown",
+        ]
+        for cat in categories:
+            for lang in ("ja", "en"):
+                with self.subTest(cat=cat, lang=lang):
+                    w_info = {
+                        "fallback_occurred": True,
+                        "warnings": ["raw"],
+                        "grouped_warnings": [
+                            {
+                                "models": ["DEIMv2"],
+                                "category": cat,
+                                "reason": "some reason",
+                                "hint": "some hint",
+                                "raw_warning": "raw",
+                            }
+                        ],
+                        "table_warning": None,
+                    }
+                    guidance = self.app.build_friendly_diagnostics_guidance(
+                        w_info, langcode=lang, active_backend="cpu"
+                    )
+                    self.assertEqual(guidance["severity"], "warning")
+                    self.assertTrue(guidance["headline"])
+                    self.assertTrue(guidance["steps"])
+                    self.assertNotIn("pip install", "\n".join(guidance["steps"]))
+
+        ok_gpu = self.app.build_friendly_diagnostics_guidance(
+            {"fallback_occurred": False, "warnings": [], "grouped_warnings": [], "table_warning": None},
+            langcode="ja",
+            active_backend="cuda",
+        )
+        self.assertEqual(ok_gpu["severity"], "ok")
+        self.assertIn("正常", ok_gpu["headline"])
+
+        err = self.app.build_friendly_diagnostics_guidance(
+            {"fallback_occurred": False, "warnings": [], "grouped_warnings": [], "table_warning": None},
+            langcode="en",
+            init_error=RuntimeError("boom"),
+        )
+        self.assertEqual(err["severity"], "error")
+        self.assertIn("boom", err["headline"])
+
+    def test_build_gui_diagnostics_report_lists_affected_models_once(self):
+        shared_warn = "[WARN] 自動選択されたGPUバックエンドの初期化に失敗したため CPU で実行します (DEIM): cuda: missing"
+        det = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                active_backend="cpu",
+                active_providers=["CPUExecutionProvider"],
+                fallback_occurred=True,
+                fallback_category="cuda_driver_missing",
+                fallback_reason="NVIDIA GPU ドライバ (nvcuda.dll) が見つかりません",
+                fallback_hint="NVIDIA 公式ドライバを更新してください",
+                warning_message=shared_warn,
+            )
+        )
+        rec = SimpleNamespace(
+            backend_profile=SimpleNamespace(
+                active_backend="cpu",
+                active_providers=["CPUExecutionProvider"],
+                fallback_occurred=True,
+                fallback_category="cuda_driver_missing",
+                fallback_reason="NVIDIA GPU ドライバ (nvcuda.dll) が見つかりません",
+                fallback_hint="NVIDIA 公式ドライバを更新してください",
+                warning_message=shared_warn.replace("(DEIM)", "(PARSEQ(rec100))"),
+            )
+        )
+        with patch.object(self.app, "format_device_diagnostics", return_value="=== DIAG ==="):
+            report = self.app.build_gui_diagnostics_report(detector=det, recognizer=rec)
+        self.assertIn("Affected models: DEIMv2, PARSeq-100", report)
+        self.assertEqual(report.count("Fallback warnings:"), 1)
+        self.assertEqual(report.count("cuda: missing"), 1)
+
+    def test_open_local_path_sync_handles_win32_darwin_linux(self):
+        with patch.object(self.app.sys, "platform", "win32"), patch.object(
+            self.app.os, "startfile", create=True
+        ) as mock_startfile:
+            self.app.open_local_path_sync("C:\\logs")
+        mock_startfile.assert_called_once_with("C:\\logs")
+
+        with patch.object(self.app.sys, "platform", "darwin"), patch.object(
+            self.app.subprocess, "run"
+        ) as mock_run:
+            self.app.open_local_path_sync("/tmp/logs")
+        mock_run.assert_called_once_with(["open", "/tmp/logs"], check=True)
+
+        with patch.object(self.app.sys, "platform", "linux"), patch.object(
+            self.app.subprocess, "run"
+        ) as mock_run:
+            self.app.open_local_path_sync("/tmp/logs")
+        mock_run.assert_called_once_with(["xdg-open", "/tmp/logs"], check=True)
 
     def test_open_preview_link_handles_win32_darwin_linux_and_http(self):
         from urllib.request import url2pathname

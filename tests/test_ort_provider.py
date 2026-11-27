@@ -1,6 +1,7 @@
 import contextlib
 import io
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
@@ -23,6 +24,9 @@ class OrtProviderTest(unittest.TestCase):
         ort_provider._CUDA_DLLS_ERROR = None
         ort_provider._CUDA_PRELOAD_OUTPUT = None
         ort_provider._CUDA_PROBE_CACHE = None
+        ort_provider._PLUGIN_ERRORS.clear()
+        ort_provider._REGISTERED_DLL_DIRS.clear()
+        ort_provider._DLL_DIR_HANDLES.clear()
 
     def test_choices_priority_and_normalization(self):
         self.assertIn("auto", ort_provider.DEVICE_CHOICES)
@@ -591,6 +595,173 @@ class OrtProviderTest(unittest.TestCase):
         self.assertIn("cudnn64_9.dll", report)
         self.assertIn("CUDA 12 detected", report)
         self.assertIn("Selected by '--device auto': cpu", report)
+
+    def test_register_bundled_nvidia_dll_dirs_and_plugin_dirs_on_windows(self):
+        added = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site = Path(tmpdir)
+            ort_init = site / "onnxruntime" / "__init__.py"
+            ort_capi = site / "onnxruntime" / "capi"
+            cu13_bin = site / "nvidia" / "cu13" / "bin" / "x86_64"
+            cudnn_bin = site / "nvidia" / "cudnn" / "bin"
+            wgpu_dir = site / "onnxruntime_ep_webgpu"
+            wgpu_d3d12 = wgpu_dir / "D3D12"
+            for d in (ort_capi, cu13_bin, cudnn_bin, wgpu_d3d12):
+                d.mkdir(parents=True, exist_ok=True)
+            ort_init.write_text("", encoding="utf-8")
+            plugin_lib = wgpu_dir / "onnxruntime_providers_webgpu.dll"
+            plugin_lib.write_bytes(b"dll")
+
+            fake_wgpu_mod = SimpleNamespace(get_library_path=lambda: str(plugin_lib))
+
+            def fake_import(name):
+                if name == "onnxruntime_ep_webgpu":
+                    return fake_wgpu_mod
+                raise ImportError(name)
+
+            with patch.object(ort_provider.sys, "platform", "win32"), patch.object(
+                ort_provider.platform, "machine", return_value="AMD64"
+            ), patch.object(
+                ort_provider.os, "add_dll_directory", side_effect=lambda p: (added.append(p), p)[1], create=True
+            ), patch.object(
+                ort_provider.ort, "__file__", str(ort_init)
+            ):
+                registered = ort_provider._register_bundled_nvidia_dll_dirs("13")
+                # Second call must be idempotent without duplicate add_dll_directory calls
+                ort_provider._register_bundled_nvidia_dll_dirs("13")
+                self.assertIn(cu13_bin, registered)
+                self.assertIn(cudnn_bin, registered)
+                self.assertIn(ort_capi, registered)
+                self.assertEqual(len(added), len(set(added)))
+                self.assertIn(str(cu13_bin.resolve()), added)
+                self.assertIn(str(cudnn_bin.resolve()), added)
+
+                with patch.dict(ort_provider._REGISTERED_PLUGINS, {}, clear=True), patch.object(
+                    ort_provider.importlib, "import_module", side_effect=fake_import
+                ), patch.object(
+                    ort_provider.ort, "register_execution_provider_library", create=True
+                ) as mock_reg:
+                    ort_provider.register_plugin_eps()
+                mock_reg.assert_called_once_with("webgpu", str(plugin_lib))
+                self.assertIn(str(wgpu_dir.resolve()), added)
+                self.assertIn(str(wgpu_d3d12.resolve()), added)
+
+    def test_probe_cuda_runtime_distinguishes_missing_driver_when_runtime_libs_load(self):
+        def fake_can_load_win(filename, candidate_paths):
+            if filename == "nvcuda.dll":
+                return False, "nvcuda.dll not found"
+            return True, None
+
+        with patch.object(ort_provider.sys, "platform", "win32"), patch.object(
+            ort_provider.ort, "get_available_providers", return_value=["CPUExecutionProvider"]
+        ), patch.object(
+            ort_provider,
+            "_bundled_cuda_provider_path",
+            return_value=Path("/fake/site-packages/onnxruntime/capi/onnxruntime_providers_cuda.dll"),
+        ), patch.object(
+            ort_provider.ort, "cuda_version", "13.0", create=True
+        ), patch.object(
+            ort_provider, "_detect_bundled_cuda_runtime", return_value=True
+        ), patch.object(
+            ort_provider, "_can_load_shared_lib", side_effect=fake_can_load_win
+        ):
+            probe = ort_provider.probe_cuda_runtime(refresh=True)
+
+        self.assertTrue(probe["declared"])
+        self.assertFalse(probe["runtime_ready"])
+        self.assertEqual(probe["missing_libs"], [])
+        self.assertTrue(probe["driver_missing"])
+        self.assertEqual(probe["issue_code"], "cuda_driver_missing")
+        self.assertIn("nvcuda.dll", probe["detail"])
+        self.assertIn("R580", probe["hint"])
+
+    def test_probe_webgpu_runtime_flags_missing_vulkan_and_plugin_errors(self):
+        with patch.object(ort_provider.sys, "platform", "linux"), patch.dict(
+            ort_provider._REGISTERED_PLUGINS,
+            {"webgpu": "/fake/libonnxruntime_providers_webgpu.so"},
+            clear=True,
+        ), patch.object(
+            ort_provider, "preload_cuda_dlls_if_needed"
+        ), patch.object(
+            ort_provider, "register_plugin_eps", return_value=dict(ort_provider._REGISTERED_PLUGINS)
+        ), patch.object(
+            ort_provider.ort, "get_available_providers", return_value=["CPUExecutionProvider"]
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[]
+        ), patch.object(
+            ort_provider, "_can_load_shared_lib", return_value=(False, "libvulkan.so.1: not found")
+        ):
+            avail = ort_provider.detect_available_backends(refresh=True)
+
+        self.assertFalse(avail["webgpu"]["available"])
+        self.assertEqual(avail["webgpu"]["status"], "missing_runtime")
+        self.assertEqual(avail["webgpu"]["issue_code"], "webgpu_vulkan_missing")
+        self.assertIn("libvulkan.so.1", avail["webgpu"]["detail"])
+
+        stderr = io.StringIO()
+        with patch.object(ort_provider, "detect_available_backends", return_value=avail), patch.object(
+            ort_provider, "_create_session_for_backend", return_value=(object(), ["CPUExecutionProvider"])
+        ), contextlib.redirect_stderr(stderr):
+            _, profile = ort_provider.create_inference_session("model.onnx", device="auto")
+        self.assertTrue(profile.fallback_occurred)
+        self.assertEqual(profile.fallback_category, "webgpu_vulkan_missing")
+        self.assertIn("libvulkan.so.1", profile.fallback_reason or "")
+
+        # Plugin load error for OpenVINO / WebGPU is also surfaced as missing_runtime
+        with patch.dict(
+            ort_provider._REGISTERED_PLUGINS, {}, clear=True
+        ), patch.dict(
+            ort_provider._PLUGIN_ERRORS,
+            {"webgpu": "DLL load failed", "openvino_ep": "OV init error"},
+            clear=True,
+        ), patch.object(
+            ort_provider, "preload_cuda_dlls_if_needed"
+        ), patch.object(
+            ort_provider, "register_plugin_eps", return_value={}
+        ), patch.object(
+            ort_provider.ort, "get_available_providers", return_value=["CPUExecutionProvider"]
+        ), patch.object(
+            ort_provider, "_safe_ep_devices", return_value=[]
+        ):
+            err_avail = ort_provider.detect_available_backends(refresh=True)
+        self.assertEqual(err_avail["webgpu"]["status"], "missing_runtime")
+        self.assertEqual(err_avail["webgpu"]["issue_code"], "webgpu_plugin_error")
+        self.assertEqual(err_avail["openvino"]["status"], "missing_runtime")
+        self.assertEqual(err_avail["openvino"]["issue_code"], "openvino_plugin_error")
+
+    def test_classify_backend_failure_and_profile_fields(self):
+        self.assertEqual(
+            ort_provider.classify_backend_failure("cuda", "cudaErrorInsufficientDriver")[0],
+            "cuda_driver_old",
+        )
+        self.assertEqual(
+            ort_provider.classify_backend_failure("cuda", "cudaErrorNoDevice: no CUDA-capable device")[0],
+            "cuda_no_device",
+        )
+        self.assertEqual(
+            ort_provider.classify_backend_failure("webgpu", "CompileShaderDXC E_INVALIDARG")[0],
+            "webgpu_dxc_error",
+        )
+        self.assertEqual(
+            ort_provider.classify_backend_failure("dml", "DmlExecutionProvider corrupted bounding boxes")[0],
+            "dml_deim_unsupported",
+        )
+
+        with patch.object(
+            ort_provider,
+            "_create_session_for_backend",
+            side_effect=[
+                RuntimeError("CompileShaderDXC E_INVALIDARG"),
+                (object(), ["CPUExecutionProvider"]),
+            ],
+        ), contextlib.redirect_stderr(io.StringIO()):
+            _, profile = ort_provider.create_inference_session(
+                "model.onnx", device="webgpu", strict_device=False
+            )
+        self.assertTrue(profile.fallback_occurred)
+        self.assertEqual(profile.fallback_category, "webgpu_dxc_error")
+        self.assertIn("DXC", profile.fallback_reason or "")
+        self.assertTrue(profile.fallback_hint)
 
 
 if __name__ == "__main__":

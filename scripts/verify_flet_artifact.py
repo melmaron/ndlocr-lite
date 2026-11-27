@@ -19,12 +19,85 @@ REQUIRED_MODELS: tuple[str, ...] = (
     "tablecenternet_s_800_v3.onnx",
 )
 
+DEFAULT_MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024  # GitHub Releases 2.00 GiB limit
+
+WINDOWS_REQUIRED_CRT_DLLS: tuple[str, ...] = (
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "msvcp140_atomic_wait.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+)
+
+WINDOWS_CUDA_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "onnxruntime_providers_cuda.dll",
+    "cudart64_13*.dll",
+    "cublas64_13*.dll",
+    "cublaslt64_13*.dll",
+    "nvrtc64_13*.dll",
+    "cudnn64_9*.dll",
+    "cudnn_ops64_9*.dll",
+)
+
+LINUX_CUDA_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "libonnxruntime_providers_cuda.so",
+    "libcudart.so.13*",
+    "libcublas.so.13*",
+    "libcublaslt.so.13*",
+    "libcurand.so.10*",
+    "libnvrtc.so.13*",
+    "libcudnn.so.9*",
+    "libcudnn_ops.so.9*",
+)
+
+WINDOWS_WEBGPU_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "onnxruntime_providers_webgpu.dll",
+    "dxcompiler.dll",
+    "d3d12core.dll",
+)
+
+WINDOWS_OPENVINO_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "onnxruntime_providers_openvino_plugin.dll",
+    "openvino.dll",
+    "tbb12.dll",
+)
+
+LINUX_WEBGPU_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "libonnxruntime_providers_webgpu.so*",
+)
+
+LINUX_OPENVINO_REQUIRED_PATTERNS: tuple[str, ...] = (
+    "libonnxruntime_providers_openvino_plugin.so*",
+    "libopenvino.so*",
+    "libtbb.so.12*",
+)
+
 
 def _format_python_dll_name(python_version: str) -> Optional[str]:
     parts = [part for part in python_version.strip().split(".") if part]
     if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
         return None
     return f"python{parts[0]}{parts[1]}.dll"
+
+
+def verify_archive_size(
+    archive_path: Path,
+    *,
+    max_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
+) -> List[str]:
+    """Return error list if packaged archive is missing or exceeds size limit."""
+    archive = Path(archive_path)
+    if not archive.is_file():
+        return [f"Packaged archive does not exist: {archive}"]
+    size_bytes = archive.stat().st_size
+    if size_bytes <= 0:
+        return [f"Packaged archive is empty: {archive}"]
+    if max_bytes > 0 and size_bytes >= max_bytes:
+        return [
+            f"Packaged archive {archive.name} size ({size_bytes:,} bytes / "
+            f"{size_bytes / (1024 ** 3):.2f} GiB) meets or exceeds limit ({max_bytes:,} bytes)"
+        ]
+    return []
 
 
 def verify_artifact(
@@ -56,31 +129,44 @@ def verify_artifact(
     effective_arch = (arch or platform.machine()).strip().lower()
     is_x86_64 = effective_arch in {"x86_64", "amd64"}
 
-    if norm_platform == "windows" and python_version:
-        expected_py_dll = _format_python_dll_name(python_version)
-        if expected_py_dll and expected_py_dll.lower() not in names_lower:
-            errors.append(f"Missing Windows embedded Python DLL: {expected_py_dll}")
+    if norm_platform == "windows":
+        if python_version:
+            expected_py_dll = _format_python_dll_name(python_version)
+            if expected_py_dll and expected_py_dll.lower() not in names_lower:
+                errors.append(f"Missing Windows embedded Python DLL: {expected_py_dll}")
+        for crt_dll in WINDOWS_REQUIRED_CRT_DLLS:
+            if crt_dll not in names_lower:
+                errors.append(f"Missing Windows VC++ runtime DLL: {crt_dll}")
 
     if norm_variant == "cuda":
-        expected_cuda = (
-            "onnxruntime_providers_cuda.dll"
+        patterns = (
+            WINDOWS_CUDA_REQUIRED_PATTERNS
             if norm_platform == "windows"
-            else "libonnxruntime_providers_cuda.so"
+            else LINUX_CUDA_REQUIRED_PATTERNS
         )
-        if expected_cuda.lower() not in names_lower:
-            errors.append(f"Missing CUDA EP library: {expected_cuda}")
+        for pattern in patterns:
+            if not any(fnmatch(name, pattern) for name in names_lower):
+                errors.append(f"Missing bundled CUDA runtime/EP library matching {pattern}")
     elif norm_variant == "gpu-generic":
-        webgpu_pattern = "*webgpu*.dll" if norm_platform == "windows" else "*webgpu*.so*"
-        if not any(fnmatch(name, webgpu_pattern) for name in names_lower):
-            errors.append(f"Missing WebGPU EP library matching {webgpu_pattern}")
+        wgpu_patterns = (
+            WINDOWS_WEBGPU_REQUIRED_PATTERNS
+            if norm_platform == "windows"
+            else LINUX_WEBGPU_REQUIRED_PATTERNS
+        )
+        for pattern in wgpu_patterns:
+            if not any(fnmatch(name, pattern) for name in names_lower):
+                errors.append(f"Missing WebGPU EP/runtime library matching {pattern}")
         if is_x86_64:
-            openvino_pattern = (
-                "*openvino*.dll" if norm_platform == "windows" else "*openvino*.so*"
+            ov_patterns = (
+                WINDOWS_OPENVINO_REQUIRED_PATTERNS
+                if norm_platform == "windows"
+                else LINUX_OPENVINO_REQUIRED_PATTERNS
             )
-            if not any(fnmatch(name, openvino_pattern) for name in names_lower):
-                errors.append(
-                    f"Missing OpenVINO EP library matching {openvino_pattern} (x86_64)"
-                )
+            for pattern in ov_patterns:
+                if not any(fnmatch(name, pattern) for name in names_lower):
+                    errors.append(
+                        f"Missing OpenVINO EP/runtime library matching {pattern} (x86_64)"
+                    )
     elif norm_variant != "base":
         errors.append(f"Unknown build variant: {variant}")
 
@@ -114,6 +200,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="Target architecture override (defaults to platform.machine())",
     )
+    parser.add_argument(
+        "--archive",
+        default=None,
+        help="Optional compressed archive (.zip/.tar.gz) to validate size limit",
+    )
+    parser.add_argument(
+        "--max-archive-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARCHIVE_BYTES,
+        help="Strict upper bound on compressed archive size in bytes",
+    )
     args = parser.parse_args(argv)
 
     output_dir = Path(args.output_dir)
@@ -124,6 +221,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         python_version=args.python_version,
         arch=args.arch,
     )
+    if args.archive:
+        errors.extend(
+            verify_archive_size(
+                Path(args.archive),
+                max_bytes=args.max_archive_bytes,
+            )
+        )
     if errors:
         print(
             f"[FAIL] Artifact verification failed for {args.platform}/{args.variant} ({output_dir}):",

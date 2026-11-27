@@ -267,9 +267,41 @@ TRANSLATIONS = {
         "ja":"GPU を利用できず CPU へフォールバックしました",
         "en":"GPU unavailable — running on CPU fallback"
     },
+    "engine_fallback_banner_short":{
+        "ja":"GPU を利用できないため CPU で実行しています（OCR はそのまま利用できます）",
+        "en":"GPU unavailable — running on CPU (OCR still works normally)"
+    },
     "engine_fallback_details_btn":{
         "ja":"原因と対処法を見る",
         "en":"View reason & fix"
+    },
+    "engine_diagnostics_open_log_folder":{
+        "ja":"ログフォルダを開く",
+        "en":"Open log folder"
+    },
+    "engine_diagnostics_tech_details":{
+        "ja":"技術詳細（不具合報告用）",
+        "en":"Technical details (for issue reports)"
+    },
+    "engine_diagnostics_summary_ok":{
+        "ja":"GPU バックエンドは正常に動作しています。",
+        "en":"GPU backend is running normally."
+    },
+    "engine_diagnostics_summary_cpu":{
+        "ja":"現在 CPU モードで動作しています。",
+        "en":"Currently running in CPU mode."
+    },
+    "engine_diagnostics_steps_title":{
+        "ja":"対処の目安",
+        "en":"Recommended steps"
+    },
+    "engine_diagnostics_open_nvidia_driver":{
+        "ja":"NVIDIA ドライバ公式ページ",
+        "en":"NVIDIA Driver Download"
+    },
+    "engine_diagnostics_open_releases":{
+        "ja":"Releases ページを開く",
+        "en":"Open Releases Page"
     },
     "engine_log_path_label":{
         "ja":"ログファイル",

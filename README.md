@@ -22,16 +22,16 @@
 
 GUI デスクトップアプリケーションのビルド済みパッケージは、**[Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases)** からダウンロードできます）。
 
-| OS | GPU / 環境 | ダウンロード対象ファイル名 | 別途必要な環境（前提条件） |
+| OS | GPU / 環境 | ダウンロード対象ファイル名 | 同梱内容・別途必要な環境（前提条件） |
 |---|---|---|---|
-| **Windows** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_windows_cuda.zip` | **CUDA 13 ランタイム + cuDNN 9 必須（非同梱）**、CUDA 13 対応 NVIDIA ドライバ（CUDA 12 のみの環境では起動時に警告表示の上 CPU へフォールバック） |
-| **Windows** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_windows_gpu_generic.zip` | DirectX 12 対応ドライバ（注意: NVIDIA GPU では WebGPU の DXC コンパイル失敗で CPU に落ちる場合があり、`cuda` 版の代替にはなりません） |
-| **Linux** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_linux_cuda.tar.gz` | **CUDA 13 ランタイム + cuDNN 9 必須（非同梱）**、CUDA 13 対応 NVIDIA ドライバ、GTK3 (`libgtk-3-0`)・glibc 2.35 以上（Ubuntu 22.04 以降目安） |
-| **Linux** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_linux_gpu_generic.tar.gz` | Vulkan (`libvulkan.so.1`) + GPU ドライバ、GTK3・glibc 2.35 以上（OpenVINO は x86_64 のみ・ARM64 は WebGPU のみ） |
+| **Windows** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_windows_cuda.zip` | **CUDA 13 + cuDNN 9 + VC++ ランタイム同梱**（CUDA Toolkit 別途導入不要・容量目安 ~1.25 GB）。CUDA 13 対応 NVIDIA ドライバ（R580 以降）のみ必要 |
+| **Windows** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_windows_gpu_generic.zip` | **WebGPU / OpenVINO / DXC / TBB / VC++ ランタイム同梱**。DirectX 12 対応ドライバのみ必要（注意: NVIDIA GPU では WebGPU の DXC コンパイル失敗で CPU に落ちる場合があり、`cuda` 版を推奨） |
+| **Linux** | NVIDIA GPU (CUDA) | `ndlocr_lite_gpu_v*_linux_cuda.tar.gz` | **CUDA 13 + cuDNN 9 ランタイム同梱**（CUDA Toolkit 別途導入不要・容量目安 ~1.55 GB）。CUDA 13 対応 NVIDIA ドライバ（R580 以降）、GTK3 (`libgtk-3-0`)・glibc 2.35 以上（Ubuntu 22.04 以降目安）が必要 |
+| **Linux** | AMD Radeon / Intel Arc / その他 | `ndlocr_lite_gpu_v*_linux_gpu_generic.tar.gz` | **WebGPU / OpenVINO / TBB ランタイム同梱**。Vulkan (`libvulkan.so.1`) + GPU ドライバ、GTK3・glibc 2.35 以上が必要（OpenVINO は x86_64 のみ・ARM64 は WebGPU のみ） |
 
 > [!NOTE]
 > - 展開後のフォルダは **日本語（全角文字）を含まないパス**（例: `C:\ndlocr-lite\`）に配置して起動してください。
-> - **`cuda` 版に CUDA 13 / cuDNN 9 ランタイムは同梱されていません**（容量肥大回避のため）。CUDA 12 のみや未導入の環境では CPU へフォールバックし、画面上部の警告バナー・「環境診断」ダイアログ・ログファイル (`ndlocr-lite.log`) に不足ライブラリ名と対処法が表示されます。
+> - **ランタイム同梱とフォールバック診断**: `cuda` 版は CUDA 13 + cuDNN 9 ランタイムを、Windows 版一式は不足しやすい VC++ ランタイム DLL（`msvcp140_1.dll`, `msvcp140_atomic_wait.dll` 等）をパッケージ内に同梱しているため、GPU ドライバのみあれば展開後すぐ利用できます（そのため `cuda` 版のアーカイブ容量は約 1.2〜1.6 GB となります）。ドライバ未導入・旧版・非対応 GPU 等で CPU へフォールバックした場合は、画面上部の警告バナー・「環境診断」ダイアログ・ログファイル (`ndlocr-lite.log`) に分かりやすい原因と対処法が表示されます。
 > - **AMD MIGraphX / ROCm**: 配布バイナリには含まれず、Linux ROCm 環境でのソース導入限定です（配布パッケージの AMD GPU は `gpu_generic` / WebGPU を利用）。
 > - CLI 版や Python ソースから直接実行したい場合は、下の [セットアップと使い方](#セットアップと使い方) を参照してください。
 
@@ -153,15 +153,11 @@ source .venv/bin/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 # A) 汎用 GPU（AMD Radeon / Intel Arc: WebGPU + OpenVINO Plugin EP, ORT 1.31.1 維持）
 pip install -r requirements-gpu-generic.txt
 
-# B) NVIDIA CUDA 13 系環境（PyPI 既定。システム CUDA 13 未導入時は pip の CUDA 13 wheel も追加）
+# B) NVIDIA CUDA 13 系環境（CUDA 13 + cuDNN 9 ランタイム wheel も自動導入）
 pip uninstall -y onnxruntime && pip install -r requirements-cuda.txt
-# システム CUDA 13 未導入時のランタイム wheel（起動時に ort.preload_dlls() で自動読み込み）:
-# pip install "onnxruntime-gpu[cuda,cudnn]==1.31.1"
-# または個別 wheel 指定:
-# pip install nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cusparse nvidia-cusolver nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cudnn-cu13
 
-# C) NVIDIA CUDA 12 系環境（Google Colab 等。Windows で cudnn64_9.dll が見つからない場合は PATH へ追加か nvidia-cudnn-cu12 を導入）
-pip uninstall -y onnxruntime && pip install -r requirements-cuda.txt
+# C) NVIDIA CUDA 12 系環境（Google Colab 等。Windows で cudnn64_9.dll が見つからない場合は nvidia-cudnn-cu12 も追加）
+pip uninstall -y onnxruntime && pip install -r requirements.txt
 pip install --force-reinstall --no-deps \
   --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ \
   onnxruntime-gpu==1.29.0

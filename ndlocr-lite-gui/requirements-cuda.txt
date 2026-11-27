@@ -1,9 +1,9 @@
 # Default PyPI onnxruntime-gpu==1.31.1 targets CUDA 13.x.
-# If CUDA 13.x system toolkit is not installed, add pip CUDA 13 runtime wheels and restart python:
-#   pip install "onnxruntime-gpu[cuda,cudnn]==1.31.1"
-# (equivalent explicit wheel list: nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cusparse nvidia-cusolver nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cudnn-cu13)
-# For CUDA 12.x environments (Azure index serves up to 1.29.0 stable; ORT>=1.25 for TableCenterNet):
-#   pip install -r requirements-cuda.txt && pip install --force-reinstall --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu==1.29.0
+# Bundled CUDA 13 + cuDNN 9 runtime wheels are installed automatically via this file
+# (no manual CUDA Toolkit / cuDNN installation or PATH/LD_LIBRARY_PATH edits needed;
+# requires an NVIDIA GPU driver supporting CUDA 13, R580 or newer).
+# For CUDA 12.x source environments (Azure index serves up to 1.29.0 stable; ORT>=1.25 for TableCenterNet):
+#   pip install -r requirements.txt && pip uninstall -y onnxruntime && pip install --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu==1.29.0
 flet==1.1.2
 dill==0.3.8
 lxml==6.1.3
@@ -19,6 +19,11 @@ pypdfium2==4.30.0
 numpy==2.2.2
 opencv-python-headless==4.11.0.86
 onnxruntime-gpu==1.31.1; python_version >= "3.11" and sys_platform != "darwin"
+nvidia-cuda-runtime~=13.0; python_version >= "3.11" and sys_platform != "darwin"
+nvidia-cublas~=13.0; python_version >= "3.11" and sys_platform != "darwin"
+nvidia-cuda-nvrtc~=13.0; python_version >= "3.11" and sys_platform != "darwin"
+nvidia-cudnn-cu13~=9.0; python_version >= "3.11" and sys_platform != "darwin"
+nvidia-curand~=10.0; python_version >= "3.11" and sys_platform == "linux"
 # Note: Python 3.10 and macOS (darwin) are unsupported for prebuilt GUI builds; ORT 1.23.2 disables TableCenterNet (requires ORT >= 1.25).
 onnxruntime==1.23.2; python_version == "3.10" or sys_platform == "darwin"
 onnx==1.23.2; python_version >= "3.11"

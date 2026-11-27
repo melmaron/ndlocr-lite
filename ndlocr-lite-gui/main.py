@@ -172,6 +172,34 @@ def build_output_result_html(document_name, pages):
     return build_html_document(document_name, markdown_pages, table_snippets)
 
 
+def open_local_path_sync(local_path, *, fallback_uri=None):
+    import webbrowser
+
+    target = str(local_path)
+    if sys.platform == 'win32':
+        os.startfile(target)
+        return
+    if sys.platform == 'darwin':
+        subprocess.run(['open', target], check=True)
+        return
+    try:
+        subprocess.run(['xdg-open', target], check=True)
+        return
+    except (FileNotFoundError, subprocess.SubprocessError):
+        uri = fallback_uri
+        if uri is None:
+            try:
+                uri = Path(target).resolve().as_uri()
+            except ValueError:
+                uri = target
+        if not webbrowser.open(uri):
+            raise OSError(f'Unable to open preview link: {target}')
+
+
+async def open_local_path(local_path):
+    await asyncio.to_thread(open_local_path_sync, local_path)
+
+
 async def open_preview_link(event):
     import webbrowser
     from urllib.parse import urlparse
@@ -182,19 +210,8 @@ async def open_preview_link(event):
     if parsed.scheme == 'file':
         path = ('//' + parsed.netloc if parsed.netloc else '') + parsed.path
         local_path = url2pathname(path)
-        if sys.platform == 'win32':
-            await asyncio.to_thread(os.startfile, local_path)
-            return
-        if sys.platform == 'darwin':
-            await asyncio.to_thread(subprocess.run, ['open', local_path], check=True)
-            return
-        try:
-            await asyncio.to_thread(subprocess.run, ['xdg-open', local_path], check=True)
-            return
-        except (FileNotFoundError, subprocess.SubprocessError):
-            if not await asyncio.to_thread(webbrowser.open, url):
-                raise OSError(f'Unable to open preview link: {url}')
-            return
+        await asyncio.to_thread(open_local_path_sync, local_path, fallback_uri=url)
+        return
     if not await asyncio.to_thread(webbrowser.open, url):
         raise OSError(f'Unable to open preview link: {url}')
 
@@ -1277,6 +1294,42 @@ def compute_engine_reload_scope(loaded_engine_state, target_engine_state) -> str
     return 'none'
 
 
+def _normalize_warning_signature(message: str) -> str:
+    """Normalize per-model labels out of legacy warning strings for deduplication."""
+    import re
+
+    text = message.strip()
+    text = re.sub(
+        r"(CPU で実行します)\s*\((?:[^()]+|\([^()]*\))*\)(:)",
+        r"\1\2",
+        text,
+    )
+    text = re.sub(
+        r"(指定されたデバイス '[^']+' を )\S+( で有効化できなかったため)",
+        r"\1<model>\2",
+        text,
+    )
+    text = re.sub(
+        r"(Requested device '[^']+' failed for )[^:]+(:)",
+        r"\1<model>\2",
+        text,
+    )
+    return text
+
+
+def _strip_model_label_from_warning(message: str) -> str:
+    """Remove per-model parenthetical tags from grouped warning text for display."""
+    import re
+
+    cleaned = message.strip()
+    cleaned = re.sub(
+        r"(CPU で実行します)\s*\((?:[^()]+|\([^()]*\))*\)(:)",
+        r"\1\2",
+        cleaned,
+    )
+    return cleaned
+
+
 def collect_engine_warnings(
     detector,
     recognizer,
@@ -1285,27 +1338,390 @@ def collect_engine_warnings(
     table_recognizer=None,
     table_error=None,
 ) -> dict:
-    """Collect deduplicated fallback warnings and table errors from loaded models."""
-    warnings = []
+    """Collect deduplicated fallback warnings and table errors grouped across models."""
+    model_entries = (
+        ('DEIMv2', detector),
+        ('PARSeq-100', recognizer),
+        ('PARSeq-30', recognizer30),
+        ('PARSeq-50', recognizer50),
+        ('TableCenterNet', table_recognizer),
+    )
+    groups = []
+    group_index_by_key = {}
     fallback_occurred = False
-    for model in (detector, recognizer, recognizer30, recognizer50, table_recognizer):
+
+    for model_name, model in model_entries:
         profile = getattr(model, 'backend_profile', None)
         if profile is None:
             continue
         if getattr(profile, 'fallback_occurred', False):
             fallback_occurred = True
         msg = getattr(profile, 'warning_message', None)
-        if isinstance(msg, str):
-            cleaned = msg.strip()
-            if cleaned and cleaned not in warnings:
-                warnings.append(cleaned)
+        reason = getattr(profile, 'fallback_reason', None)
+        hint = getattr(profile, 'fallback_hint', None)
+        category = getattr(profile, 'fallback_category', None)
+
+        cleaned = msg.strip() if isinstance(msg, str) else ''
+        if not cleaned and not (isinstance(reason, str) and reason.strip()):
+            continue
+
+        if category or (isinstance(reason, str) and reason.strip()):
+            key = ('structured', category or '', (reason or '').strip())
+        else:
+            key = ('raw', _normalize_warning_signature(cleaned), '')
+
+        idx = group_index_by_key.get(key)
+        if idx is None:
+            group_index_by_key[key] = len(groups)
+            groups.append({
+                'models': [model_name],
+                'category': category,
+                'reason': reason.strip() if isinstance(reason, str) and reason.strip() else None,
+                'hint': hint.strip() if isinstance(hint, str) and hint.strip() else None,
+                'raw_warning': cleaned,
+            })
+        elif model_name not in groups[idx]['models']:
+            groups[idx]['models'].append(model_name)
+
+    warnings = []
+    for group in groups:
+        if group['raw_warning']:
+            display_msg = (
+                _strip_model_label_from_warning(group['raw_warning'])
+                if len(group['models']) > 1
+                else group['raw_warning']
+            )
+            if display_msg not in warnings:
+                warnings.append(display_msg)
+        elif group['reason']:
+            if group['reason'] not in warnings:
+                warnings.append(group['reason'])
+
     table_warning = str(table_error).strip() if table_error is not None else None
     if table_warning == '':
         table_warning = None
     return {
         'fallback_occurred': fallback_occurred,
         'warnings': warnings,
+        'grouped_warnings': groups,
         'table_warning': table_warning,
+    }
+
+
+def _concise_reason_for_display(group: dict | None, raw_warning: str, langcode: str) -> str:
+    """Return a concise single-line root-cause summary without noisy prefixes."""
+    import re
+
+    category = (group or {}).get('category') if isinstance(group, dict) else None
+    reason = (group or {}).get('reason') if isinstance(group, dict) else None
+    en_by_category = {
+        'cuda_driver_missing': 'NVIDIA GPU driver (nvcuda.dll / libcuda.so.1) not found',
+        'cuda_driver_old': 'Installed NVIDIA driver is too old for CUDA 13 (R580+ required)',
+        'cuda_no_device': 'No CUDA-capable NVIDIA GPU detected',
+        'cuda_runtime_missing': 'Bundled CUDA 13 / cuDNN 9 libraries could not be loaded',
+        'webgpu_vulkan_missing': 'Vulkan runtime (libvulkan.so.1) not found',
+        'webgpu_d3d12_missing': 'DirectX 12 runtime (d3d12.dll) not found',
+        'webgpu_dxc_error': 'WebGPU shader compilation failed (DXC)',
+        'webgpu_plugin_error': 'WebGPU plugin failed to load',
+        'openvino_plugin_error': 'OpenVINO plugin failed to load',
+        'dml_deim_unsupported': 'Layout detection (DEIMv2) runs on CPU while PARSeq uses DirectML GPU',
+    }
+    if langcode == 'en' and category in en_by_category:
+        return en_by_category[category]
+    if reason:
+        return re.sub(r'^(cuda|webgpu|openvino|migraphx|rocm|dml)\s*:\s*', '', reason, flags=re.IGNORECASE)
+
+    first_line = (raw_warning or '').splitlines()[0].strip() if raw_warning else ''
+    for pat in (
+        r'^\[WARN\]\s*',
+        r'^自動選択されたGPUバックエンドの初期化に失敗したため\s*CPU\s*で実行します\s*(?:\((?:[^()]+|\([^()]*\))*\))?\s*:\s*',
+        r'^指定されたデバイス\s*\'[^\']+\'\s*を.*?フォールバックしました。\s*',
+        r'^(cuda|webgpu|openvino|migraphx|rocm|dml)\s*:\s*',
+    ):
+        first_line = re.sub(pat, '', first_line, flags=re.IGNORECASE).strip()
+    return first_line
+
+
+def format_fallback_banner_summary(
+    warning_info: dict,
+    langcode: str = 'ja',
+    init_error=None,
+) -> str:
+    """Format a concise 1-line warning banner without duplicated fallback prefixes."""
+    if init_error is not None:
+        return (
+            f'OCRモデル初期化に失敗しました: {init_error}'
+            if langcode == 'ja'
+            else f'OCR model initialization failed: {init_error}'
+        )
+    if warning_info.get('fallback_occurred'):
+        groups = warning_info.get('grouped_warnings') or []
+        first_group = groups[0] if groups else None
+        raw_warnings = warning_info.get('warnings') or []
+        raw_first = raw_warnings[0] if raw_warnings else ''
+        reason_text = _concise_reason_for_display(first_group, raw_first, langcode)
+        base = TRANSLATIONS['engine_fallback_banner_short'][langcode]
+        if reason_text:
+            return f'{base} — {reason_text}'
+        return base
+    if warning_info.get('table_warning'):
+        prefix = TRANSLATIONS['table_structure_unavailable_prefix'][langcode]
+        return f"{prefix}: {warning_info['table_warning'].splitlines()[0]}"
+    return ''
+
+
+def build_friendly_diagnostics_guidance(
+    warning_info: dict,
+    langcode: str = 'ja',
+    init_error=None,
+    active_backend: str | None = None,
+) -> dict:
+    """Build plain-language guidance steps and helpful links for the Diagnostics dialog."""
+    nvidia_url = 'https://www.nvidia.com/drivers'
+    releases_url = 'https://github.com/melmaron/ndlocr-lite-gpu/releases'
+    is_ja = langcode != 'en'
+
+    if init_error is not None:
+        return {
+            'severity': 'error',
+            'category': 'init_error',
+            'headline': (
+                f'OCRモデルの読み込みに失敗しました: {init_error}'
+                if is_ja
+                else f'Failed to initialize OCR models: {init_error}'
+            ),
+            'steps': (
+                [
+                    '配布フォルダを日本語（全角文字）を含まない場所（例: C:\\ndlocr-lite\\）へ展開し直してください。',
+                    '下の「ログフォルダを開く」から ndlocr-lite.log を確認するか、「診断結果をコピー」して Issue へお送りください。',
+                ]
+                if is_ja
+                else [
+                    'Re-extract the archive to a path without non-ASCII characters (e.g. C:\\ndlocr-lite\\).',
+                    'Open the log folder below to inspect ndlocr-lite.log, or copy diagnostics for an issue report.',
+                ]
+            ),
+            'links': [
+                (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+            ],
+        }
+
+    if not warning_info.get('fallback_occurred'):
+        if warning_info.get('table_warning'):
+            return {
+                'severity': 'warning',
+                'category': 'table_warning',
+                'headline': (
+                    f"{TRANSLATIONS['table_structure_unavailable_prefix'][langcode]}: "
+                    f"{warning_info['table_warning'].splitlines()[0]}"
+                ),
+                'steps': (
+                    ['通常の文字認識（OCR）はそのまま利用できます。表構造認識を有効にするには ONNX Runtime 1.25 以上が必要です。']
+                    if is_ja
+                    else ['Standard text OCR continues to work normally. Table structure recognition requires ONNX Runtime >= 1.25.']
+                ),
+                'links': [],
+            }
+        backend_label = active_backend or 'cpu'
+        is_gpu = backend_label not in ('cpu', 'none', '')
+        return {
+            'severity': 'ok',
+            'category': None,
+            'headline': (
+                TRANSLATIONS['engine_diagnostics_summary_ok'][langcode]
+                if is_gpu
+                else TRANSLATIONS['engine_diagnostics_summary_cpu'][langcode]
+            ),
+            'steps': (
+                ['問題なく動作しています。GPU を利用したい場合は「出力設定」から実行デバイスを確認できます。']
+                if is_ja and not is_gpu
+                else (
+                    ['GPU バックエンドは正常に初期化されています。このまま高速 OCR を利用できます。']
+                    if is_ja
+                    else ['No action needed.']
+                )
+            ),
+            'links': [],
+        }
+
+    groups = warning_info.get('grouped_warnings') or []
+    first_group = groups[0] if groups else None
+    category = (first_group or {}).get('category')
+    raw_first = (first_group or {}).get('raw_warning') or (
+        (warning_info.get('warnings') or [''])[0]
+    )
+    reason_text = _concise_reason_for_display(first_group, raw_first, langcode)
+
+    if category == 'cuda_driver_missing':
+        headline = reason_text or (
+            'NVIDIA GPU ドライバが見つからないため CPU で動作しています'
+            if is_ja
+            else 'NVIDIA GPU driver not found — running on CPU'
+        )
+        steps = (
+            [
+                'このパッケージには CUDA 13 + cuDNN 9 ランタイムが同梱されているため、CUDA Toolkit の別途インストールは不要です。',
+                'NVIDIA GPU 搭載 PC の場合は、NVIDIA 公式ドライバ（R580 以降）をインストールして PC を再起動してください。',
+                'AMD Radeon / Intel Arc 搭載 PC の場合は、Releases ページから gpu_generic 版をダウンロードしてご利用ください。',
+                'ドライバ更新前でも、CPU モードのまま OCR は正常に利用できます。',
+            ]
+            if is_ja
+            else [
+                'CUDA 13 and cuDNN 9 runtimes are already bundled in this package (no separate CUDA Toolkit needed).',
+                'If you have an NVIDIA GPU, install the latest NVIDIA driver (R580 or newer) and restart.',
+                'If you have an AMD Radeon or Intel Arc GPU, download the gpu_generic package from Releases.',
+                'OCR continues to work normally on CPU in the meantime.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_nvidia_driver'][langcode], nvidia_url),
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'cuda_driver_old':
+        headline = reason_text
+        steps = (
+            [
+                'CUDA 13 + cuDNN 9 ランタイム自体は同梱されていますが、お使いの NVIDIA GPU ドライバが旧バージョンのため GPU を起動できませんでした。',
+                'NVIDIA 公式ページから最新ドライバ（R580 以降）をインストールして再起動してください（CUDA Toolkit の導入は不要です）。',
+            ]
+            if is_ja
+            else [
+                'CUDA 13 + cuDNN 9 runtimes are bundled, but your NVIDIA display driver is older than R580.',
+                'Install the latest official NVIDIA driver (R580+) and reboot (no CUDA Toolkit install needed).',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_nvidia_driver'][langcode], nvidia_url),
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'cuda_no_device':
+        headline = reason_text
+        steps = (
+            [
+                '認識可能な NVIDIA GPU が見つかりませんでした。GPU 搭載環境ではデバイス認識と NVIDIA ドライバを確認してください。',
+                'AMD Radeon / Intel Arc 搭載環境の場合は、Releases ページの gpu_generic 版をご利用ください。',
+            ]
+            if is_ja
+            else [
+                'No NVIDIA CUDA-capable GPU was detected.',
+                'If you use AMD Radeon or Intel Arc graphics, please download the gpu_generic package from Releases.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'cuda_runtime_missing':
+        headline = reason_text
+        steps = (
+            [
+                '同梱の CUDA 13 / cuDNN 9 ライブラリを読み込めませんでした。圧縮ファイルを日本語（全角文字）を含まないフォルダへ一式すべて再展開してください。',
+                'セキュリティソフト等により site-packages\\nvidia 配下の DLL が隔離されていないか確認してください。',
+                'NVIDIA 公式ドライバが最新（R580 以降）かもあわせてご確認ください。',
+            ]
+            if is_ja
+            else [
+                'Bundled CUDA 13 / cuDNN 9 libraries failed to load. Re-extract the full archive into a path with ASCII characters only.',
+                'Check that antivirus software did not quarantine files under site-packages/nvidia.',
+                'Also ensure your NVIDIA GPU driver is R580 or newer.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+            (TRANSLATIONS['engine_diagnostics_open_nvidia_driver'][langcode], nvidia_url),
+        ]
+    elif category == 'webgpu_vulkan_missing':
+        headline = reason_text
+        steps = (
+            [
+                'Linux 環境で WebGPU を使うには Vulkan ローダ (libvulkan.so.1) と GPU 用 Vulkan ドライバが必要です。',
+                'Ubuntu / Debian 系の例: sudo apt install libvulkan1 mesa-vulkan-drivers を実行してアプリを再起動してください。',
+            ]
+            if is_ja
+            else [
+                'WebGPU on Linux requires the Vulkan loader (libvulkan.so.1) and a GPU Vulkan driver.',
+                'On Ubuntu/Debian, install `libvulkan1` and `mesa-vulkan-drivers` (or your vendor GPU driver), then restart.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'webgpu_d3d12_missing':
+        headline = reason_text
+        steps = (
+            [
+                'DirectX 12 ランタイム (d3d12.dll) が見つかりませんでした。Windows 10 (1909 以降) / 11 と最新の GPU ドライバをご確認ください。',
+            ]
+            if is_ja
+            else [
+                'DirectX 12 runtime (d3d12.dll) was not found. Ensure Windows 10 (1909+)/11 and updated GPU drivers are installed.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'webgpu_dxc_error':
+        headline = reason_text
+        steps = (
+            [
+                'NVIDIA GPU 環境をお使いの場合は、Releases ページから cuda 版（windows_cuda.zip）をご利用ください。',
+                'AMD Radeon / Intel Arc をお使いの場合は、GPU ドライバを最新版へ更新して再起動してください。',
+            ]
+            if is_ja
+            else [
+                'If you have an NVIDIA GPU, please use the cuda package (windows_cuda.zip) from Releases.',
+                'If you have an AMD Radeon or Intel Arc GPU, update your graphics driver and restart.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category in ('webgpu_plugin_error', 'openvino_plugin_error'):
+        headline = reason_text
+        steps = (
+            [
+                'GPU プラグインの読み込みに失敗しました。配布アーカイブを日本語を含まないパスへ欠けなく再展開してください。',
+                'GPU ドライバを最新版へ更新してから再起動してください。',
+            ]
+            if is_ja
+            else [
+                'GPU plugin failed to load. Re-extract the full archive to an ASCII-only folder.',
+                'Update your GPU drivers and restart.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+    elif category == 'dml_deim_unsupported':
+        headline = reason_text
+        steps = (
+            ['レイアウト検出のみ精度保護のため CPU で実行し、文字認識 (PARSeq) は DirectML GPU で実行しています。そのままご利用いただけます。']
+            if is_ja
+            else ['Layout detection runs on CPU for accuracy protection while PARSeq runs on DirectML GPU.']
+        )
+        links = []
+    else:
+        headline = reason_text or TRANSLATIONS['engine_fallback_banner_short'][langcode]
+        steps = (
+            [
+                'GPU バックエンドの初期化に失敗したため CPU モードで動作しています（OCR 機能自体はそのまま利用できます）。',
+                'GPU ドライバの更新や、配布フォルダを日本語（全角文字）を含まないパスへ展開しているかご確認ください。',
+            ]
+            if is_ja
+            else [
+                'Running in CPU fallback mode because GPU initialization failed (OCR continues to work normally).',
+                'Ensure GPU drivers are up to date and the package is extracted to an ASCII-only folder.',
+            ]
+        )
+        links = [
+            (TRANSLATIONS['engine_diagnostics_open_releases'][langcode], releases_url),
+        ]
+
+    return {
+        'severity': 'warning',
+        'category': category,
+        'headline': headline,
+        'steps': steps,
+        'links': links,
     }
 
 
@@ -1331,7 +1747,7 @@ def build_device_dropdown_options(availability: dict, is_ja: bool):
             if ready:
                 suffix = '利用可能' if is_ja else 'ready'
             elif status == 'missing_runtime':
-                suffix = 'ランタイム不足' if is_ja else 'missing runtime'
+                suffix = 'ドライバ/環境不足' if is_ja else 'missing driver/runtime'
             else:
                 suffix = '未検出' if is_ja else 'unavailable'
             label = f'{label} [{suffix}]'
@@ -1386,7 +1802,19 @@ def build_gui_diagnostics_report(
         table_recognizer,
         table_error=table_error,
     )
-    if warning_info['warnings']:
+    grouped = warning_info.get('grouped_warnings') or []
+    if grouped:
+        blocks = []
+        for grp in grouped:
+            models_line = f"Affected models: {', '.join(grp['models'])}"
+            body = grp.get('raw_warning') or grp.get('reason') or ''
+            if len(grp['models']) > 1 and grp.get('raw_warning'):
+                body = _strip_model_label_from_warning(grp['raw_warning'])
+            elif not grp.get('raw_warning') and grp.get('hint'):
+                body = f"{body}\n  Hint: {grp['hint']}"
+            blocks.append(f"{models_line}\n{body}".strip())
+        sections.append('Fallback warnings:\n' + '\n\n'.join(blocks))
+    elif warning_info['warnings']:
         sections.append('Fallback warnings:\n' + '\n\n'.join(warning_info['warnings']))
     if warning_info['table_warning']:
         sections.append(f"TableCenterNet status:\n  {warning_info['table_warning']}")
@@ -2809,6 +3237,9 @@ def main(page: ft.Page, args=None, download_models=False):
             )
 
         def show_diagnostics_dialog(e=None):
+            import webbrowser
+
+            lang = config_obj['langcode']
             diag_body = ft.Text(
                 build_current_diagnostics_text(refresh=True),
                 size=12,
@@ -2817,18 +3248,132 @@ def main(page: ft.Page, args=None, download_models=False):
                 key='diagnostics_report_text',
             )
             diag_copy_status = ft.Text('', size=12, color=ft.Colors.GREEN_700)
+            guidance_container = ft.Container(
+                border_radius=8,
+                padding=12,
+                key='diagnostics_guidance_card',
+            )
+
+            async def open_external_url(url: str):
+                await asyncio.to_thread(webbrowser.open, url)
+
+            async def open_log_folder(_=None):
+                target_dir = GUI_LOG_PATH.parent if GUI_LOG_PATH is not None else APP_DATA_DIR
+                try:
+                    await open_local_path(target_dir)
+                except Exception as exc:
+                    diag_copy_status.value = f'{target_dir} ({exc})'
+                    diag_copy_status.color = ft.Colors.RED_700
+                    page.update()
+
+            def populate_guidance_card():
+                active_lang = config_obj['langcode']
+                warning_info = collect_engine_warnings(
+                    origin_detector,
+                    origin_recognizer,
+                    origin_recognizer30,
+                    origin_recognizer50,
+                    origin_table_recognizer,
+                    table_error=model_state.get('table_error'),
+                )
+                active_prof = (
+                    getattr(origin_recognizer, 'backend_profile', None)
+                    or getattr(origin_detector, 'backend_profile', None)
+                )
+                active_backend = getattr(active_prof, 'active_backend', None) if active_prof else None
+                guidance = build_friendly_diagnostics_guidance(
+                    warning_info,
+                    langcode=active_lang,
+                    init_error=model_state.get('error'),
+                    active_backend=active_backend,
+                )
+                severity = guidance.get('severity', 'ok')
+                if severity == 'error':
+                    guidance_container.bgcolor = ft.Colors.RED_50
+                    guidance_container.border = ft.Border.all(1, ft.Colors.RED_300)
+                    icon_name = ft.Icons.ERROR_OUTLINE
+                    icon_color = ft.Colors.RED_700
+                elif severity == 'warning':
+                    guidance_container.bgcolor = ft.Colors.AMBER_100
+                    guidance_container.border = ft.Border.all(1, ft.Colors.AMBER_400)
+                    icon_name = ft.Icons.WARNING_AMBER
+                    icon_color = ft.Colors.AMBER_900
+                else:
+                    guidance_container.bgcolor = ft.Colors.GREEN_50
+                    guidance_container.border = ft.Border.all(1, ft.Colors.GREEN_300)
+                    icon_name = ft.Icons.CHECK_CIRCLE_OUTLINE
+                    icon_color = ft.Colors.GREEN_700
+
+                card_controls = [
+                    ft.Row(
+                        controls=[
+                            ft.Icon(icon_name, color=icon_color, size=20),
+                            ft.Text(
+                                guidance['headline'],
+                                size=13,
+                                weight=ft.FontWeight.W_600,
+                                color=ft.Colors.GREY_900,
+                                expand=True,
+                                selectable=True,
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ]
+                steps = guidance.get('steps') or []
+                if steps:
+                    card_controls.append(
+                        ft.Text(
+                            TRANSLATIONS['engine_diagnostics_steps_title'][active_lang],
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=ft.Colors.GREY_800,
+                        )
+                    )
+                    for idx, step in enumerate(steps, start=1):
+                        card_controls.append(
+                            ft.Text(
+                                f'{idx}. {step}',
+                                size=12,
+                                color=ft.Colors.GREY_900,
+                                selectable=True,
+                            )
+                        )
+                links = guidance.get('links') or []
+                if links:
+                    link_buttons = [
+                        ft.OutlinedButton(
+                            link_label,
+                            icon=ft.Icons.OPEN_IN_NEW,
+                            on_click=lambda _ev, u=link_url: page.run_task(open_external_url, u),
+                        )
+                        for link_label, link_url in links
+                    ]
+                    card_controls.append(ft.Row(controls=link_buttons, wrap=True, spacing=8))
+                guidance_container.content = ft.Column(
+                    controls=card_controls,
+                    spacing=4,
+                    tight=True,
+                )
+
+            populate_guidance_card()
 
             def refresh_diag(_):
                 diag_body.value = build_current_diagnostics_text(refresh=True)
                 diag_copy_status.value = ''
+                diag_copy_status.color = ft.Colors.GREEN_700
+                populate_guidance_card()
                 refresh_engine_status_ui()
                 page.update()
 
             async def copy_diag(_):
                 try:
                     await clipboard.set(diag_body.value or '')
+                    diag_copy_status.color = ft.Colors.GREEN_700
                     diag_copy_status.value = TRANSLATIONS['engine_diagnostics_copied'][config_obj['langcode']]
                 except Exception as exc:
+                    diag_copy_status.color = ft.Colors.RED_700
                     diag_copy_status.value = f'Copy failed: {exc}'
                 page.update()
 
@@ -2841,20 +3386,27 @@ def main(page: ft.Page, args=None, download_models=False):
                 title=ft.Row(
                     controls=[
                         ft.Icon(ft.Icons.MONITOR_HEART, color=ft.Colors.PRIMARY),
-                        ft.Text(TRANSLATIONS['engine_diagnostics_title'][config_obj['langcode']]),
+                        ft.Text(TRANSLATIONS['engine_diagnostics_title'][lang]),
                     ],
                     spacing=8,
                 ),
                 content=ft.Column(
                     controls=[
+                        guidance_container,
                         diag_copy_status,
+                        ft.Text(
+                            TRANSLATIONS['engine_diagnostics_tech_details'][lang],
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=ft.Colors.ON_SURFACE_VARIANT,
+                        ),
                         ft.Container(
                             content=ft.Column(
                                 controls=[diag_body],
                                 scroll=ft.ScrollMode.AUTO,
                             ),
                             width=760,
-                            height=420,
+                            height=250,
                             padding=10,
                             bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
                             border_radius=8,
@@ -2865,18 +3417,24 @@ def main(page: ft.Page, args=None, download_models=False):
                 ),
                 actions=[
                     ft.TextButton(
-                        TRANSLATIONS['engine_diagnostics_refresh'][config_obj['langcode']],
+                        TRANSLATIONS['engine_diagnostics_open_log_folder'][lang],
+                        icon=ft.Icons.FOLDER_OPEN,
+                        on_click=open_log_folder,
+                        key='diagnostics_open_log_btn',
+                    ),
+                    ft.TextButton(
+                        TRANSLATIONS['engine_diagnostics_refresh'][lang],
                         on_click=refresh_diag,
                         key='diagnostics_refresh_btn',
                     ),
                     ft.TextButton(
-                        TRANSLATIONS['engine_diagnostics_copy'][config_obj['langcode']],
+                        TRANSLATIONS['engine_diagnostics_copy'][lang],
                         icon=ft.Icons.CONTENT_COPY,
                         on_click=copy_diag,
                         key='diagnostics_copy_btn',
                     ),
                     ft.Button(
-                        TRANSLATIONS['common_close'][config_obj['langcode']],
+                        TRANSLATIONS['common_close'][lang],
                         on_click=close_diag,
                         key='diagnostics_close_btn',
                     ),
@@ -2969,24 +3527,12 @@ def main(page: ft.Page, args=None, download_models=False):
                     table_structure_notice_text.visible = False
 
             if has_issue and not model_state.get('banner_dismissed'):
-                if model_state.get('error') is not None:
-                    summary = (
-                        f"OCRモデル初期化に失敗しました: {model_state['error']}"
-                        if lang == 'ja'
-                        else f"OCR model initialization failed: {model_state['error']}"
-                    )
-                elif warning_info['fallback_occurred'] and warning_info['warnings']:
-                    first_line = warning_info['warnings'][0].splitlines()[0]
-                    if first_line.startswith('[WARN]'):
-                        first_line = first_line[len('[WARN]'):].strip()
-                    summary = f"{TRANSLATIONS['engine_fallback_banner_title'][lang]} — {first_line}"
-                elif warning_info['fallback_occurred']:
-                    summary = TRANSLATIONS['engine_fallback_banner_title'][lang]
-                else:
-                    prefix = TRANSLATIONS['table_structure_unavailable_prefix'][lang]
-                    summary = f"{prefix}: {warning_info['table_warning'].splitlines()[0]}"
-                engine_warning_text.value = summary
-                engine_warning_banner.visible = True
+                engine_warning_text.value = format_fallback_banner_summary(
+                    warning_info,
+                    langcode=lang,
+                    init_error=model_state.get('error'),
+                )
+                engine_warning_banner.visible = bool(engine_warning_text.value)
             else:
                 engine_warning_banner.visible = False
         for settings_checkbox in (
