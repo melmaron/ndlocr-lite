@@ -422,8 +422,8 @@ class GuiGpuConfigTest(unittest.TestCase):
         orig_handlers = list(parent_logger.handlers)
         orig_log_path = self.app.GUI_LOG_PATH
         ort_provider._WARNED_KEYS.clear()
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
                 p1 = self.app.configure_gui_logging(log_dir=tmpdir)
                 p2 = self.app.configure_gui_logging(log_dir=tmpdir)
                 self.assertEqual(p1, p2)
@@ -440,12 +440,12 @@ class GuiGpuConfigTest(unittest.TestCase):
                 contents = p1.read_text(encoding="utf-8")
                 self.assertIn("gui test message", contents)
                 self.assertIn("ort test warning", contents)
-        finally:
-            for h in list(parent_logger.handlers):
-                if h not in orig_handlers:
-                    parent_logger.removeHandler(h)
-                    h.close()
-            self.app.GUI_LOG_PATH = orig_log_path
+            finally:
+                for h in list(parent_logger.handlers):
+                    if h not in orig_handlers:
+                        parent_logger.removeHandler(h)
+                        h.close()
+                self.app.GUI_LOG_PATH = orig_log_path
 
     def test_build_gui_diagnostics_report_contains_profiles_diagnostics_and_log_path(self):
         det = SimpleNamespace(
@@ -464,6 +464,7 @@ class GuiGpuConfigTest(unittest.TestCase):
                 warning_message="CUDA 13 missing cudart64_13.dll",
             )
         )
+        fake_log_path = Path("/tmp/ndlocr-lite.log")
         with patch.object(
             self.app, "format_device_diagnostics", return_value="=== DIAG ===\nSelected: cpu"
         ):
@@ -471,14 +472,14 @@ class GuiGpuConfigTest(unittest.TestCase):
                 detector=det,
                 recognizer=rec,
                 table_error="DeformConv unsupported",
-                log_path=Path("/tmp/ndlocr-lite.log"),
+                log_path=fake_log_path,
                 refresh=True,
             )
         self.assertIn("Active sessions:", report)
         self.assertIn("DEIMv2 (detector): cpu", report)
         self.assertIn("CUDA 13 missing cudart64_13.dll", report)
         self.assertIn("DeformConv unsupported", report)
-        self.assertIn("Log file: /tmp/ndlocr-lite.log", report)
+        self.assertIn(f"Log file: {fake_log_path}", report)
         self.assertIn("=== DIAG ===", report)
 
     def test_build_device_dropdown_options_distinguishes_missing_runtime(self):
@@ -497,24 +498,27 @@ class GuiGpuConfigTest(unittest.TestCase):
         self.assertIn("unavailable", en_opts["webgpu"])
 
     def test_open_preview_link_handles_win32_darwin_linux_and_http(self):
+        from urllib.request import url2pathname
+
         event = SimpleNamespace(data="file:///tmp/sample_table.html")
+        expected_local = url2pathname("/tmp/sample_table.html")
         with patch.object(self.app.sys, "platform", "win32"), patch.object(
             self.app.os, "startfile", create=True
         ) as mock_startfile:
             asyncio.run(self.app.open_preview_link(event))
-        mock_startfile.assert_called_once()
+        mock_startfile.assert_called_once_with(expected_local)
 
         with patch.object(self.app.sys, "platform", "darwin"), patch.object(
             self.app.subprocess, "run"
         ) as mock_run:
             asyncio.run(self.app.open_preview_link(event))
-        mock_run.assert_called_once_with(["open", "/tmp/sample_table.html"], check=True)
+        mock_run.assert_called_once_with(["open", expected_local], check=True)
 
         with patch.object(self.app.sys, "platform", "linux"), patch.object(
             self.app.subprocess, "run"
         ) as mock_run:
             asyncio.run(self.app.open_preview_link(event))
-        mock_run.assert_called_once_with(["xdg-open", "/tmp/sample_table.html"], check=True)
+        mock_run.assert_called_once_with(["xdg-open", expected_local], check=True)
 
         with patch.object(self.app.sys, "platform", "linux"), patch.object(
             self.app.subprocess, "run", side_effect=FileNotFoundError("no xdg-open")
