@@ -100,7 +100,7 @@ jobs:
             cp requirements-cuda.txt requirements.txt
             cp ndlocr-lite-gui/requirements-cuda.txt ndlocr-lite-gui/requirements.txt
           fi
-          echo "BINARY_NAME=ndlocr_lite_v${BUILD_VERSION}_${{ matrix.artifact-suffix }}" >> "$GITHUB_ENV"
+          echo "BINARY_NAME=ndlocr_lite_gpu_v${BUILD_VERSION}_${{ matrix.artifact-suffix }}" >> "$GITHUB_ENV"
 
       - name: Install Python Dependencies
         run: |

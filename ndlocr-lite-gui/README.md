@@ -3,7 +3,7 @@
 NDLOCR-Liteの使い方を説明します。
 
 ## 起動方法
-[GitHub Releases ページ](https://github.com/melmaron/ndlocr-gpu/releases) から、お使いのOSに対応する圧縮ファイル（Windows: `ndlocr_lite_v*_windows_cuda.zip` / `..._windows_gpu_generic.zip`、Linux: `..._linux_cuda.tar.gz` / `..._linux_gpu_generic.tar.gz`、macOS: `..._macos_apple_silicon.tar.gz` / `..._macos_intel.tar.gz`）をダウンロードし、展開して `ndlocr_lite` をダブルクリック等で実行してください。
+[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases) から、お使いのOSに対応する圧縮ファイル（Windows: `ndlocr_lite_gpu_v*_windows_cuda.zip` / `..._windows_gpu_generic.zip`、Linux: `..._linux_cuda.tar.gz` / `..._linux_gpu_generic.tar.gz`、macOS: `..._macos_apple_silicon.tar.gz` / `..._macos_intel.tar.gz`）をダウンロードし、展開して `ndlocr_lite` をダブルクリック等で実行してください。
 
 なお、セキュリティに関する警告が出ることがあります。
 
