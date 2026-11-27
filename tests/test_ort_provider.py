@@ -599,7 +599,7 @@ class OrtProviderTest(unittest.TestCase):
     def test_register_bundled_nvidia_dll_dirs_and_plugin_dirs_on_windows(self):
         added = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            site = Path(tmpdir)
+            site = Path(tmpdir).resolve()
             ort_init = site / "onnxruntime" / "__init__.py"
             ort_capi = site / "onnxruntime" / "capi"
             cu13_bin = site / "nvidia" / "cu13" / "bin" / "x86_64"
