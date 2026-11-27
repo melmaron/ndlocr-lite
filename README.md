@@ -20,7 +20,7 @@
 
 ## ダウンロード
 
-GUI デスクトップアプリケーションのビルド済みパッケージは、**[GitHub Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases)** からダウンロードできます（最新の開発ビルドは [GitHub Actions (`build-flet-cross`)](https://github.com/melmaron/ndlocr-lite-gpu/actions/workflows/build-flet-cross.yml) の Artifacts からも入手可能です）。
+GUI デスクトップアプリケーションのビルド済みパッケージは、**[Releases ページ](https://github.com/melmaron/ndlocr-lite-gpu/releases)** からダウンロードできます）。
 
 | OS | GPU / 環境 | ダウンロード対象ファイル名 |
 |---|---|---|
